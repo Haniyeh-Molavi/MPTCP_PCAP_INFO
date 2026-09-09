@@ -114,22 +114,28 @@ python protocol_layer/ethernet.py "Dataset\mptcp-dump_20150308_21403700.pcap"
 
 # IP Layer extractor:
 python protocol_layer/ip.py "Dataset\mptcp-dump_20150308_21403700.pcap"
+
+# TCP Layer extractor:
+python protocol_layer/tcp.py "Dataset\mptcp-dump_20150308_21403700.pcap"
 ```
 
 ---
 
 ### 10. Select Specific Protocol Layers in main.py
-Control which protocol layers are extracted via the `--layer` flag (`all`, `ethernet`, or `ip`):
+Control which protocol layers are extracted via the `--layer` flag (`all`, `ethernet`, `ip`, or `tcp`):
 
 ```powershell
+# Extract all layers (default: Ethernet, IP, and TCP):
+python main.py Dataset --layer all
+
+# Extract only TCP layer features:
+python main.py Dataset --layer tcp
+
 # Extract only IP layer features:
 python main.py Dataset --layer ip
 
 # Extract only Ethernet layer features:
 python main.py Dataset --layer ethernet
-
-# Extract all layers (default: Ethernet & IP):
-python main.py Dataset --layer all
 ```
 
 ---
@@ -137,7 +143,7 @@ python main.py Dataset --layer all
 ## Command-Line Arguments Reference
 
 ```text
-usage: main.py [-h] [--layer {all,ethernet,ip}] [--output-dir OUTPUT_DIR]
+usage: main.py [-h] [--layer {all,ethernet,ip,tcp}] [--output-dir OUTPUT_DIR]
                [--workers WORKERS] [--link-speed LINK_SPEED] [--limit LIMIT]
                [--no-recursive] [--json]
                [folder]
@@ -147,8 +153,8 @@ positional arguments:
 
 options:
   -h, --help            Show this help message and exit.
-  --layer {all,ethernet,ip}
-                        Protocol layer(s) to extract: 'all' (default), 'ethernet', or 'ip'.
+  --layer {all,ethernet,ip,tcp}
+                        Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', or 'tcp'.
   --output-dir OUTPUT_DIR, -o OUTPUT_DIR
                         Optional directory to save CSV files (default: alongside source PCAP).
   --workers WORKERS, -w WORKERS
@@ -204,3 +210,44 @@ options:
 | **`Path Count`** | Cumulative count of distinct active IP paths | `2` |
 | **`TTL Mean`** | Running arithmetic mean of TTL values | `255.00` |
 | **`TTL Variance`** | Running sample variance of TTL values (Welford's algorithm) | `0.00` |
+
+### 3. TCP Layer (`[pcap_name]_tcp.csv`)
+
+| Column | Description | Example |
+| :--- | :--- | :--- |
+| **`Packet Number`** | Sequential 1-based TCP packet index | `1, 2, 3...` |
+| **`Timestamp`** | High-precision epoch timestamp | `1426795223.659552` |
+| **`Source Port`** | Source TCP port number | `41192` |
+| **`Destination Port`** | Destination TCP port number | `8388` |
+| **`Sequence Number`** | Raw 32-bit TCP sequence number | `1496084684` |
+| **`Acknowledgment Number`** | Raw 32-bit TCP acknowledgment number | `2188164481` |
+| **`Window Size`** | Advertised TCP receive window size | `42340` |
+| **`Checksum`** | TCP segment checksum in hexadecimal | `0xCFE5` |
+| **`TCP Length`** | TCP segment payload data length in bytes | `0`, `1448` |
+| **`Flags (SYN)`** | Synchronize flag (1 or 0) | `1` / `0` |
+| **`Flags (ACK)`** | Acknowledgment flag (1 or 0) | `1` / `0` |
+| **`Flags (FIN)`** | Finish flag (1 or 0) | `1` / `0` |
+| **`Flags (RST)`** | Reset flag (1 or 0) | `1` / `0` |
+| **`Flags (PSH)`** | Push flag (1 or 0) | `1` / `0` |
+| **`Flags (URG)`** | Urgent flag (1 or 0) | `1` / `0` |
+| **`MSS Option`** | Maximum Segment Size option value | `1460` |
+| **`SACK Option`** | SACK Permitted or SACK block count | `Permitted`, `2 Blocks` |
+| **`Timestamp Option`** | TCP Timestamp values (`TSval;TSecr`) | `8104048;347922022` |
+| **`Window Scale Option`** | Window scale shift value | `6` |
+| **`Retransmission Count`** | Cumulative retransmissions on this connection | `0`, `1` |
+| **`Fast Retransmission Count`** | Cumulative fast retransmissions triggered | `0` |
+| **`Duplicate ACK Count`** | Cumulative duplicate ACKs observed | `0`, `3` |
+| **`Out-of-Order Packets`** | Cumulative out-of-order packets observed | `0` |
+| **`RTT`** | Measured Round Trip Time sample for this ACK (seconds) | `0.036751` |
+| **`RTT Min`** | Running minimum RTT observed on this connection | `0.036751` |
+| **`RTT Max`** | Running maximum RTT observed on this connection | `0.045120` |
+| **`RTT Std`** | Running standard deviation of RTT samples | `0.002341` |
+| **`Packet Loss Rate`** | Running packet loss ratio (`retransmissions / total_packets`) | `0.000000` |
+| **`Throughput`** | Running throughput in bytes/s on this connection | `1538209.57` |
+| **`Goodput`** | Running non-retransmitted payload throughput (bytes/s) | `1250000.00` |
+| **`Congestion Events`** | Cumulative count of congestion events (fast retransmits + 3x dup acks) | `0` |
+| **`Flow Completion Time`** | Elapsed duration for this connection (seconds) | `0.036863` |
+| **`Idle Time`** | Cumulative connection idle time (gaps > 100ms) | `0.000000` |
+| **`Active Time`** | Cumulative connection active transfer time | `0.036863` |
+| **`Inter-arrival Time`** | Time since previous packet on this connection (seconds) | `0.000112` |
+| **`Burst Size`** | Payload bytes in current burst train (gaps < 5ms) | `1448` |

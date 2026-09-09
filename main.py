@@ -22,18 +22,20 @@ try:
         stream_pcap_packets,
     )
     from protocol_layer.ip import extract_ip_to_csv
+    from protocol_layer.tcp import extract_tcp_to_csv
 except ImportError:
     # Fallback if running directly inside folder
     _ALT_DIR = _CURRENT_DIR / "protocol_layer"
     if str(_ALT_DIR) not in sys.path:
         sys.path.insert(0, str(_ALT_DIR))
-    from protocol_layer.ethernet import (
+    from ethernet import (
         DEFAULT_LINK_SPEED_BPS,
         extract_ethernet_to_csv,
         parse_link_speed,
         stream_pcap_packets,
     )
-    from protocol_layer.ip import extract_ip_to_csv
+    from ip import extract_ip_to_csv
+    from tcp import extract_tcp_to_csv
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
 
@@ -121,6 +123,18 @@ def _pcap_worker(task: tuple) -> dict:
         except Exception as exc:
             result["ip_error"] = str(exc)
 
+    # 3. TCP Layer extraction
+    if "tcp" in layers:
+        try:
+            tcp_res = extract_tcp_to_csv(
+                pcap_path=pcap_path,
+                output_csv_path=output_dir,
+                limit_packets=limit_packets,
+            )
+            result["tcp"] = tcp_res
+        except Exception as exc:
+            result["tcp_error"] = str(exc)
+
     result["total_worker_time"] = max(time.perf_counter() - t0, 1e-9)
     return result
 
@@ -128,7 +142,7 @@ def _pcap_worker(task: tuple) -> dict:
 def process_folder_protocol_layers(
     folder: Path | str,
     output_dir: Path | str | None = None,
-    layers: tuple[str, ...] = ("ethernet", "ip"),
+    layers: tuple[str, ...] = ("ethernet", "ip", "tcp"),
     link_speed_bps: float = DEFAULT_LINK_SPEED_BPS,
     max_workers: int | None = None,
     limit_packets: int | None = None,
@@ -136,7 +150,7 @@ def process_folder_protocol_layers(
 ) -> list[dict]:
     """
     Find all PCAP files in folder and automatically dispatch each PCAP to the requested
-    protocol layer extractors (protocol_layer/ethernet.py and protocol_layer/ip.py).
+    protocol layer extractors (ethernet, ip, tcp).
 
     Uses ProcessPoolExecutor for concurrent multi-file processing on large captures.
     """
@@ -187,7 +201,7 @@ def process_folder_protocol_layers(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract protocol layer features (Ethernet & IP) from PCAP files into CSV."
+        description="Extract protocol layer features (Ethernet, IP, TCP) from PCAP files into CSV."
     )
     parser.add_argument(
         "folder",
@@ -197,9 +211,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--layer",
-        choices=["all", "ethernet", "ip"],
+        choices=["all", "ethernet", "ip", "tcp"],
         default="all",
-        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', or 'ip'.",
+        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', or 'tcp'.",
     )
     parser.add_argument(
         "--output-dir",
@@ -257,11 +271,13 @@ def main() -> None:
     link_speed_bps = parse_link_speed(args.link_speed)
 
     if args.layer == "all":
-        selected_layers = ("ethernet", "ip")
+        selected_layers = ("ethernet", "ip", "tcp")
     elif args.layer == "ethernet":
         selected_layers = ("ethernet",)
-    else:
+    elif args.layer == "ip":
         selected_layers = ("ip",)
+    else:
+        selected_layers = ("tcp",)
 
     t_start = time.perf_counter()
     results = process_folder_protocol_layers(
@@ -285,20 +301,23 @@ def main() -> None:
 
     layer_names = " & ".join(l.upper() for l in selected_layers)
     print(f"\nProcessed {len(results)} PCAP file(s) across [{layer_names}] layers:")
-    print("=" * 125)
+    print("=" * 135)
 
     header_cols = f"{'PCAP File':<32} "
     if "ethernet" in selected_layers:
-        header_cols += f"{'Ethernet CSV':<28} {'Frames':>10} "
+        header_cols += f"{'Ethernet CSV':<24} {'Frames':>8} "
     if "ip" in selected_layers:
-        header_cols += f"{'IP CSV':<28} {'IP Pkts':>10} {'Paths':>6} "
+        header_cols += f"{'IP CSV':<24} {'IP Pkts':>8} "
+    if "tcp" in selected_layers:
+        header_cols += f"{'TCP CSV':<24} {'TCP Pkts':>8} {'Flows':>6} "
     header_cols += f"{'Speed':>14} {'Status':>8}"
 
     print(header_cols)
-    print("-" * 125)
+    print("-" * 135)
 
     total_frames = 0
     total_ip_pkts = 0
+    total_tcp_pkts = 0
 
     for item in results:
         pcap_name = item["pcap_name"]
@@ -311,9 +330,9 @@ def main() -> None:
                 csv_name = Path(eth["csv_file"]).name
                 cnt = eth["packet_count"]
                 total_frames += cnt
-                row_str += f"{csv_name:<28} {cnt:>10,d} "
+                row_str += f"{csv_name:<24} {cnt:>8,d} "
             else:
-                row_str += f"{'ERROR':<28} {'N/A':>10} "
+                row_str += f"{'ERROR':<24} {'N/A':>8} "
                 status = "ERR"
 
         if "ip" in selected_layers:
@@ -321,26 +340,39 @@ def main() -> None:
             if ip_info:
                 csv_name = Path(ip_info["csv_file"]).name
                 cnt = ip_info["packet_count"]
-                paths = ip_info["path_count"]
                 total_ip_pkts += cnt
-                row_str += f"{csv_name:<28} {cnt:>10,d} {paths:>6d} "
+                row_str += f"{csv_name:<24} {cnt:>8,d} "
             else:
-                row_str += f"{'ERROR':<28} {'N/A':>10} {'N/A':>6} "
+                row_str += f"{'ERROR':<24} {'N/A':>8} "
+                status = "ERR"
+
+        if "tcp" in selected_layers:
+            tcp_info = item.get("tcp")
+            if tcp_info:
+                csv_name = Path(tcp_info["csv_file"]).name
+                cnt = tcp_info["packet_count"]
+                flows_cnt = tcp_info["tcp_flows_count"]
+                total_tcp_pkts += cnt
+                row_str += f"{csv_name:<24} {cnt:>8,d} {flows_cnt:>6d} "
+            else:
+                row_str += f"{'ERROR':<24} {'N/A':>8} {'N/A':>6} "
                 status = "ERR"
 
         worker_time = item.get("total_worker_time", 1.0)
-        pps = (total_frames or total_ip_pkts) / max(worker_time, 1e-9)
+        pps = (total_frames or total_ip_pkts or total_tcp_pkts) / max(worker_time, 1e-9)
         pps_str = f"{pps:,.0f} pkt/s"
         row_str += f"{pps_str:>14} {status:>8}"
         print(row_str)
 
-    print("=" * 125)
-    summary_text = f"Summary: {len(results)} files processed in {total_elapsed:.2f}s"
+    print("=" * 135)
+    summary_parts = [f"Summary: {len(results)} files processed in {total_elapsed:.2f}s"]
     if "ethernet" in selected_layers:
-        summary_text += f" | {total_frames:,d} Ethernet frames"
+        summary_parts.append(f"{total_frames:,d} Ethernet frames")
     if "ip" in selected_layers:
-        summary_text += f" | {total_ip_pkts:,d} IP packets"
-    print(f"{summary_text}\n")
+        summary_parts.append(f"{total_ip_pkts:,d} IP packets")
+    if "tcp" in selected_layers:
+        summary_parts.append(f"{total_tcp_pkts:,d} TCP packets")
+    print(" | ".join(summary_parts) + "\n")
 
 
 if __name__ == "__main__":
