@@ -23,19 +23,21 @@ try:
     )
     from protocol_layer.ip import extract_ip_to_csv
     from protocol_layer.tcp import extract_tcp_to_csv
+    from protocol_layer.mptcp_level import extract_mptcp_to_csv
 except ImportError:
     # Fallback if running directly inside folder
     _ALT_DIR = _CURRENT_DIR / "protocol_layer"
     if str(_ALT_DIR) not in sys.path:
         sys.path.insert(0, str(_ALT_DIR))
-    from ethernet import (
+    from protocol_layer.ethernet import (
         DEFAULT_LINK_SPEED_BPS,
         extract_ethernet_to_csv,
         parse_link_speed,
         stream_pcap_packets,
     )
-    from ip import extract_ip_to_csv
-    from tcp import extract_tcp_to_csv
+    from protocol_layer.ip import extract_ip_to_csv
+    from protocol_layer.tcp import extract_tcp_to_csv
+    from protocol_layer.mptcp_level import extract_mptcp_to_csv
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
 
@@ -135,6 +137,18 @@ def _pcap_worker(task: tuple) -> dict:
         except Exception as exc:
             result["tcp_error"] = str(exc)
 
+    # 4. MPTCP Layer extraction
+    if "mptcp" in layers:
+        try:
+            mptcp_res = extract_mptcp_to_csv(
+                pcap_path=pcap_path,
+                output_csv_path=output_dir,
+                limit_packets=limit_packets,
+            )
+            result["mptcp"] = mptcp_res
+        except Exception as exc:
+            result["mptcp_error"] = str(exc)
+
     result["total_worker_time"] = max(time.perf_counter() - t0, 1e-9)
     return result
 
@@ -142,7 +156,7 @@ def _pcap_worker(task: tuple) -> dict:
 def process_folder_protocol_layers(
     folder: Path | str,
     output_dir: Path | str | None = None,
-    layers: tuple[str, ...] = ("ethernet", "ip", "tcp"),
+    layers: tuple[str, ...] = ("ethernet", "ip", "tcp", "mptcp"),
     link_speed_bps: float = DEFAULT_LINK_SPEED_BPS,
     max_workers: int | None = None,
     limit_packets: int | None = None,
@@ -150,7 +164,7 @@ def process_folder_protocol_layers(
 ) -> list[dict]:
     """
     Find all PCAP files in folder and automatically dispatch each PCAP to the requested
-    protocol layer extractors (ethernet, ip, tcp).
+    protocol layer extractors (ethernet, ip, tcp, mptcp).
 
     Uses ProcessPoolExecutor for concurrent multi-file processing on large captures.
     """
@@ -201,7 +215,7 @@ def process_folder_protocol_layers(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract protocol layer features (Ethernet, IP, TCP) from PCAP files into CSV."
+        description="Extract protocol layer features (Ethernet, IP, TCP, MPTCP) from PCAP files into CSV."
     )
     parser.add_argument(
         "folder",
@@ -211,9 +225,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--layer",
-        choices=["all", "ethernet", "ip", "tcp"],
+        choices=["all", "ethernet", "ip", "tcp", "mptcp"],
         default="all",
-        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', or 'tcp'.",
+        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', or 'mptcp'.",
     )
     parser.add_argument(
         "--output-dir",
@@ -271,13 +285,15 @@ def main() -> None:
     link_speed_bps = parse_link_speed(args.link_speed)
 
     if args.layer == "all":
-        selected_layers = ("ethernet", "ip", "tcp")
+        selected_layers = ("ethernet", "ip", "tcp", "mptcp")
     elif args.layer == "ethernet":
         selected_layers = ("ethernet",)
     elif args.layer == "ip":
         selected_layers = ("ip",)
-    else:
+    elif args.layer == "tcp":
         selected_layers = ("tcp",)
+    else:
+        selected_layers = ("mptcp",)
 
     t_start = time.perf_counter()
     results = process_folder_protocol_layers(
@@ -310,14 +326,17 @@ def main() -> None:
         header_cols += f"{'IP CSV':<24} {'IP Pkts':>8} "
     if "tcp" in selected_layers:
         header_cols += f"{'TCP CSV':<24} {'TCP Pkts':>8} {'Flows':>6} "
+    if "mptcp" in selected_layers:
+        header_cols += f"{'MPTCP CSV':<24} {'MPTCP Pkts':>10} {'Conns':>6} "
     header_cols += f"{'Speed':>14} {'Status':>8}"
 
     print(header_cols)
-    print("-" * 135)
+    print("-" * 160)
 
     total_frames = 0
     total_ip_pkts = 0
     total_tcp_pkts = 0
+    total_mptcp_pkts = 0
 
     for item in results:
         pcap_name = item["pcap_name"]
@@ -358,13 +377,25 @@ def main() -> None:
                 row_str += f"{'ERROR':<24} {'N/A':>8} {'N/A':>6} "
                 status = "ERR"
 
+        if "mptcp" in selected_layers:
+            mptcp_info = item.get("mptcp")
+            if mptcp_info:
+                csv_name = Path(mptcp_info["csv_file"]).name
+                cnt = mptcp_info["packet_count"]
+                conns_cnt = mptcp_info["mptcp_conns_count"]
+                total_mptcp_pkts += cnt
+                row_str += f"{csv_name:<24} {cnt:>10,d} {conns_cnt:>6d} "
+            else:
+                row_str += f"{'ERROR':<24} {'N/A':>10} {'N/A':>6} "
+                status = "ERR"
+
         worker_time = item.get("total_worker_time", 1.0)
-        pps = (total_frames or total_ip_pkts or total_tcp_pkts) / max(worker_time, 1e-9)
+        pps = (total_frames or total_ip_pkts or total_tcp_pkts or total_mptcp_pkts) / max(worker_time, 1e-9)
         pps_str = f"{pps:,.0f} pkt/s"
         row_str += f"{pps_str:>14} {status:>8}"
         print(row_str)
 
-    print("=" * 135)
+    print("=" * 160)
     summary_parts = [f"Summary: {len(results)} files processed in {total_elapsed:.2f}s"]
     if "ethernet" in selected_layers:
         summary_parts.append(f"{total_frames:,d} Ethernet frames")
@@ -372,6 +403,8 @@ def main() -> None:
         summary_parts.append(f"{total_ip_pkts:,d} IP packets")
     if "tcp" in selected_layers:
         summary_parts.append(f"{total_tcp_pkts:,d} TCP packets")
+    if "mptcp" in selected_layers:
+        summary_parts.append(f"{total_mptcp_pkts:,d} MPTCP packets")
     print(" | ".join(summary_parts) + "\n")
 
 
