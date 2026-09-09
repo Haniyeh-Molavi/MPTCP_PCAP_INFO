@@ -1,0 +1,6 @@
+# High-performance PCAP streaming engine (C-struct unpacking, ~600k+ pkts/s)
+dpkt>=1.9.8
+
+# Fallback reader and protocol support
+scapy>=2.5.0
+
