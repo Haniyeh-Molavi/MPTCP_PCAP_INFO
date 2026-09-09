@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.pcap
+*.pcapng
+*.cap
+.pytest_cache/
+.vscode/
+.idea/
+
