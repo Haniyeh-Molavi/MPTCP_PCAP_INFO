@@ -9,31 +9,31 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterator, Tuple
 
-# Attempt high-performance parser import (dpkt is ~10-50x faster than scapy)
+# Ensure workspace root is in sys.path for protocol_layer package imports
+_CURRENT_DIR = Path(__file__).resolve().parent
+if str(_CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(_CURRENT_DIR))
+
 try:
-    import dpkt
+    from protocol_layer.ethernet import (
+        DEFAULT_LINK_SPEED_BPS,
+        extract_ethernet_to_csv,
+        parse_link_speed,
+        stream_pcap_packets,
+    )
 except ImportError:
-    dpkt = None
-
-# Attempt Scapy fallback (streaming raw reader, avoids full layer object trees)
-try:
-    from scapy.utils import RawPcapReader, RawPcapNgReader
-except ImportError:
-    RawPcapReader = None
-    RawPcapNgReader = None
-
-
-# Known magic bytes for fast format detection
-PCAP_LE = b"\xd4\xc3\xb2\xa1"
-PCAP_BE = b"\xa1\xb2\xc3\xd4"
-PCAP_NS_LE = b"\x4d\x3c\xb2\xa1"
-PCAP_NS_BE = b"\xa1\xb2\x3c\x4d"
-PCAP_CLASSIC_MAGICS = {PCAP_LE, PCAP_BE, PCAP_NS_LE, PCAP_NS_BE}
-
-PCAPNG_MAGIC = b"\n\r\r\n"  # 0x0A0D0D0A (Section Header Block)
+    # Fallback if running directly inside folder
+    _ALT_DIR = _CURRENT_DIR / "protocol_layer"
+    if str(_ALT_DIR) not in sys.path:
+        sys.path.insert(0, str(_ALT_DIR))
+    from protocol_layer.ethernet import (
+        DEFAULT_LINK_SPEED_BPS,
+        extract_ethernet_to_csv,
+        parse_link_speed,
+        stream_pcap_packets,
+    )
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
-DEFAULT_BUFFER_SIZE = 4 * 1024 * 1024  # 4 MB read buffer for high disk throughput
 
 
 def format_bytes(size: int | float) -> str:
@@ -43,31 +43,6 @@ def format_bytes(size: int | float) -> str:
             return f"{size:.2f} {unit}" if unit != "B" else f"{int(size)} B"
         size /= 1024.0
     return f"{size:.2f} PB"
-
-
-def detect_pcap_format(file_path: Path) -> str:
-    """
-    Inspect the first 4 bytes of the file to determine if it is classic PCAP or PCAPNG.
-    Returns 'pcap', 'pcapng', or 'unknown'.
-    """
-    try:
-        with file_path.open("rb") as f:
-            magic = f.read(4)
-            if magic in PCAP_CLASSIC_MAGICS:
-                return "pcap"
-            if magic == PCAPNG_MAGIC:
-                return "pcapng"
-    except OSError:
-        pass
-
-    # Fallback to extension check
-    suffix = file_path.suffix.lower()
-    if suffix in {".pcap", ".cap"}:
-        return "pcap"
-    if suffix == ".pcapng":
-        return "pcapng"
-
-    return "unknown"
 
 
 def find_pcap_files(folder: Path | str, recursive: bool = True) -> list[Path]:
@@ -85,157 +60,10 @@ def find_pcap_files(folder: Path | str, recursive: bool = True) -> list[Path]:
     return sorted(files)
 
 
-def stream_pcap_packets(
-    file_path: Path | str,
-    buffer_size: int = DEFAULT_BUFFER_SIZE,
-) -> Iterator[Tuple[float, bytes]]:
-    """
-    Stream packets from a PCAP or PCAPNG file without loading the capture into memory.
-    Yields (timestamp: float, packet_bytes: bytes).
-
-    Uses dpkt for maximum throughput (~600k+ pkts/s), with seamless fallback to
-    Scapy's streaming RawPcapReader / RawPcapNgReader.
-    """
-    file_path = Path(file_path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {file_path}")
-
-    fmt = detect_pcap_format(file_path)
-
-    # 1. Primary Engine: DPKT (Fastest, zero layer-overhead)
-    if dpkt is not None:
-        try:
-            with file_path.open("rb", buffering=buffer_size) as handle:
-                if fmt == "pcapng":
-                    reader = dpkt.pcapng.Reader(handle)
-                else:
-                    reader = dpkt.pcap.Reader(handle)
-
-                for timestamp, packet_bytes in reader:
-                    yield float(timestamp), packet_bytes
-                return
-        except (dpkt.NeedData, EOFError):
-            # Gracefully handle truncated file at end
-            return
-        except Exception:
-            # If dpkt encounters an unhandled block type, fall back to Scapy
-            pass
-
-    # 2. Fallback Engine: Scapy Raw Streaming Readers
-    str_path = str(file_path)
-    if fmt == "pcapng" and RawPcapNgReader is not None:
-        try:
-            for packet_bytes, metadata in RawPcapNgReader(str_path):
-                if hasattr(metadata, "tshigh") and hasattr(metadata, "tslow"):
-                    resol = float(getattr(metadata, "tsresol", 1e6) or 1e6)
-                    ts = float((metadata.tshigh << 32) | metadata.tslow) / resol
-                elif hasattr(metadata, "sec") and hasattr(metadata, "usec"):
-                    ts = float(metadata.sec) + float(metadata.usec) / 1e6
-                elif hasattr(metadata, "time"):
-                    ts = float(metadata.time)
-                else:
-                    ts = 0.0
-                yield ts, packet_bytes
-            return
-        except Exception:
-            pass
-
-    if RawPcapReader is not None:
-        try:
-            for packet_bytes, metadata in RawPcapReader(str_path):
-                if hasattr(metadata, "sec") and hasattr(metadata, "usec"):
-                    ts = float(metadata.sec) + float(metadata.usec) / 1e6
-                elif hasattr(metadata, "time"):
-                    ts = float(metadata.time)
-                else:
-                    ts = 0.0
-                yield ts, packet_bytes
-            return
-        except Exception:
-            pass
-
-    # If neither succeeded or libraries missing
-    if dpkt is None and RawPcapReader is None:
-        raise RuntimeError(
-            "Neither dpkt nor scapy is installed. Please install dpkt for best performance:\n"
-            "  pip install dpkt"
-        )
-    raise RuntimeError(f"Unable to read PCAP file '{file_path}' with available libraries.")
-
-
-def process_pcap_file(
-    file_path: Path | str,
-    limit_packets: int | None = None,
-    buffer_size: int = DEFAULT_BUFFER_SIZE,
-) -> dict:
-    """
-    Stream and summarize a single PCAP/PCAPNG file.
-    Returns a dictionary of metrics:
-      - file: str
-      - file_name: str
-      - file_size_bytes: int
-      - packet_count: int
-      - payload_bytes: int
-      - first_timestamp: float | None
-      - last_timestamp: float | None
-      - duration_seconds: float
-      - processing_time_seconds: float
-      - throughput_packets_per_sec: float
-      - throughput_mb_per_sec: float
-    """
-    file_path = Path(file_path)
-    file_size = file_path.stat().st_size if file_path.exists() else 0
-    packet_count = 0
-    payload_bytes = 0
-    first_ts: float | None = None
-    last_ts: float | None = None
-
-    t_start = time.perf_counter()
-
-    for ts, pkt_bytes in stream_pcap_packets(file_path, buffer_size=buffer_size):
-        packet_count += 1
-        payload_bytes += len(pkt_bytes)
-        if first_ts is None:
-            first_ts = ts
-        last_ts = ts
-
-        if limit_packets is not None and packet_count >= limit_packets:
-            break
-
-    t_elapsed = max(time.perf_counter() - t_start, 1e-9)
-
-    duration = 0.0
-    if first_ts is not None and last_ts is not None:
-        duration = max(0.0, last_ts - first_ts)
-
-    throughput_pps = packet_count / t_elapsed
-    throughput_mbps = (payload_bytes / (1024 * 1024)) / t_elapsed
-
-    return {
-        "file": str(file_path),
-        "file_name": file_path.name,
-        "file_size_bytes": file_size,
-        "packet_count": packet_count,
-        "payload_bytes": payload_bytes,
-        "first_timestamp": first_ts,
-        "last_timestamp": last_ts,
-        "duration_seconds": duration,
-        "processing_time_seconds": t_elapsed,
-        "throughput_packets_per_sec": throughput_pps,
-        "throughput_mb_per_sec": throughput_mbps,
-    }
-
-
-def _process_file_worker(file_path_str: str, limit_packets: int | None) -> dict:
-    """Helper for parallel execution across process boundaries."""
-    return process_pcap_file(Path(file_path_str), limit_packets=limit_packets)
-
-
 def stream_folder_packets(
     folder: Path | str,
     recursive: bool = True,
     limit_packets: int | None = None,
-    buffer_size: int = DEFAULT_BUFFER_SIZE,
 ) -> Iterator[Tuple[Path, float, bytes]]:
     """
     Sequentially stream packets across all PCAP files found in the given folder.
@@ -246,73 +74,118 @@ def stream_folder_packets(
     total_yielded = 0
 
     for file_path in find_pcap_files(folder, recursive=recursive):
-        for ts, pkt_bytes in stream_pcap_packets(file_path, buffer_size=buffer_size):
+        for ts, pkt_bytes in stream_pcap_packets(file_path):
             yield file_path, ts, pkt_bytes
             total_yielded += 1
             if limit_packets is not None and total_yielded >= limit_packets:
                 return
 
 
-def process_folder(
+def _ethernet_worker(task: tuple[str, str | None, float, int | None]) -> dict:
+    """Worker function for multiprocessing pool to process a PCAP file with ethernet.py."""
+    pcap_path_str, output_dir_str, link_speed_bps, limit_packets = task
+    pcap_path = Path(pcap_path_str)
+    output_dir = Path(output_dir_str) if output_dir_str else None
+    return extract_ethernet_to_csv(
+        pcap_path=pcap_path,
+        output_csv_path=output_dir,
+        link_speed_bps=link_speed_bps,
+        limit_packets=limit_packets,
+    )
+
+
+def process_folder_ethernet(
     folder: Path | str,
-    recursive: bool = True,
+    output_dir: Path | str | None = None,
+    link_speed_bps: float = DEFAULT_LINK_SPEED_BPS,
     max_workers: int | None = None,
     limit_packets: int | None = None,
+    recursive: bool = True,
 ) -> list[dict]:
     """
-    Process all PCAP files found in the folder.
-    When multiple files exist and max_workers != 1, uses ProcessPoolExecutor to
-    process files concurrently across CPU cores.
+    Find all PCAP files in folder, bring each PCAP to ethernet.py to extract features,
+    and save them into CSV files with the same name as the PCAP files.
+
+    Uses ProcessPoolExecutor for concurrent multi-file processing on large captures.
     """
-    folder = Path(folder)
+    folder = Path(folder).expanduser().resolve()
     pcap_files = find_pcap_files(folder, recursive=recursive)
 
     if not pcap_files:
         return []
 
+    out_dir_str = str(Path(output_dir).resolve()) if output_dir else None
+
     # If only 1 file or explicit single worker, run sequentially
     if len(pcap_files) == 1 or max_workers == 1:
-        return [process_pcap_file(f, limit_packets=limit_packets) for f in pcap_files]
+        results = []
+        for pcap in pcap_files:
+            try:
+                res = extract_ethernet_to_csv(
+                    pcap_path=pcap,
+                    output_csv_path=Path(out_dir_str) if out_dir_str else None,
+                    link_speed_bps=link_speed_bps,
+                    limit_packets=limit_packets,
+                )
+                results.append(res)
+            except Exception as exc:
+                csv_name = f"{pcap.stem}.csv"
+                results.append({
+                    "pcap_file": str(pcap),
+                    "csv_file": str(Path(out_dir_str) / csv_name if out_dir_str else pcap.with_suffix(".csv")),
+                    "error": str(exc),
+                    "packet_count": 0,
+                    "total_bytes": 0,
+                    "csv_size_bytes": 0,
+                    "min_frame_size": 0,
+                    "max_frame_size": 0,
+                    "avg_frame_size": 0.0,
+                    "processing_time_seconds": 0.0,
+                    "throughput_packets_per_sec": 0.0,
+                })
+        return results
 
-    # Parallel processing across CPU cores
+    # Parallel processing across multiple CPU cores
     workers = max_workers or min(os.cpu_count() or 1, len(pcap_files))
-    results = []
+    tasks = [
+        (str(pcap), out_dir_str, link_speed_bps, limit_packets)
+        for pcap in pcap_files
+    ]
 
+    results = []
     with ProcessPoolExecutor(max_workers=workers) as executor:
         future_to_file = {
-            executor.submit(_process_file_worker, str(f), limit_packets): f
-            for f in pcap_files
+            executor.submit(_ethernet_worker, task): Path(task[0])
+            for task in tasks
         }
         for future in as_completed(future_to_file):
-            file_path = future_to_file[future]
+            pcap = future_to_file[future]
             try:
                 res = future.result()
                 results.append(res)
             except Exception as exc:
-                results.append(
-                    {
-                        "file": str(file_path),
-                        "file_name": file_path.name,
-                        "error": str(exc),
-                        "packet_count": 0,
-                        "payload_bytes": 0,
-                        "file_size_bytes": file_path.stat().st_size if file_path.exists() else 0,
-                        "first_timestamp": None,
-                        "last_timestamp": None,
-                        "duration_seconds": 0.0,
-                        "processing_time_seconds": 0.0,
-                        "throughput_packets_per_sec": 0.0,
-                        "throughput_mb_per_sec": 0.0,
-                    }
-                )
+                csv_name = f"{pcap.stem}.csv"
+                results.append({
+                    "pcap_file": str(pcap),
+                    "csv_file": str(Path(out_dir_str) / csv_name if out_dir_str else pcap.with_suffix(".csv")),
+                    "error": str(exc),
+                    "packet_count": 0,
+                    "total_bytes": 0,
+                    "csv_size_bytes": 0,
+                    "min_frame_size": 0,
+                    "max_frame_size": 0,
+                    "avg_frame_size": 0.0,
+                    "processing_time_seconds": 0.0,
+                    "throughput_packets_per_sec": 0.0,
+                })
 
-    results.sort(key=lambda x: x["file"])
+    results.sort(key=lambda x: x["pcap_file"])
     return results
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="High-performance streaming reader for large PCAP/PCAPNG files in a folder."
+        description="Extract Ethernet features from PCAP/PCAPNG files into CSV using ethernet.py."
     )
     parser.add_argument(
         "folder",
@@ -321,11 +194,23 @@ def main() -> None:
         help="Folder containing PCAP files (default: current directory).",
     )
     parser.add_argument(
+        "--output-dir",
+        "-o",
+        default=None,
+        help="Optional directory to save CSV files (default: same directory as PCAP).",
+    )
+    parser.add_argument(
         "--workers",
         "-w",
         type=int,
         default=None,
         help="Number of parallel worker processes (default: CPU count).",
+    )
+    parser.add_argument(
+        "--link-speed",
+        "-s",
+        default="1G",
+        help="Interface link speed for utilization evaluation (e.g. 100M, 1G, 10G; default: 1G).",
     )
     parser.add_argument(
         "--limit",
@@ -347,16 +232,30 @@ def main() -> None:
     args = parser.parse_args()
 
     folder = Path(args.folder).expanduser().resolve()
+    # If run with default '.' and no PCAPs found in current directory, prompt interactively
+    if args.folder == "." and not find_pcap_files(folder, recursive=not args.no_recursive):
+        if sys.stdin.isatty():
+            try:
+                entered = input("Enter path to folder containing PCAP files: ").strip().strip('"\'')
+                if entered:
+                    folder = Path(entered).expanduser().resolve()
+            except (EOFError, KeyboardInterrupt):
+                sys.exit(0)
+
     if not folder.exists():
         print(f"Error: Folder does not exist: {folder}", file=sys.stderr)
         sys.exit(1)
 
+    link_speed_bps = parse_link_speed(args.link_speed)
+
     t_start = time.perf_counter()
-    results = process_folder(
+    results = process_folder_ethernet(
         folder=folder,
-        recursive=not args.no_recursive,
+        output_dir=args.output_dir,
+        link_speed_bps=link_speed_bps,
         max_workers=args.workers,
         limit_packets=args.limit,
+        recursive=not args.no_recursive,
     )
     total_elapsed = time.perf_counter() - t_start
 
@@ -369,37 +268,35 @@ def main() -> None:
         return
 
     total_packets = sum(r.get("packet_count", 0) for r in results)
-    total_file_bytes = sum(r.get("file_size_bytes", 0) for r in results)
-    total_payload_bytes = sum(r.get("payload_bytes", 0) for r in results)
-    overall_throughput_pps = total_packets / max(total_elapsed, 1e-9)
-    overall_throughput_mb = (total_payload_bytes / (1024 * 1024)) / max(total_elapsed, 1e-9)
+    total_payload = sum(r.get("total_bytes", 0) for r in results)
+    overall_pps = total_packets / max(total_elapsed, 1e-9)
+    overall_mb = (total_payload / (1024 * 1024)) / max(total_elapsed, 1e-9)
 
-    print(f"\nProcessed {len(results)} file(s) in: {folder}")
-    print("=" * 100)
+    print(f"\nProcessed {len(results)} PCAP file(s) via protocol layer/ethernet.py:")
+    print("=" * 110)
     print(
-        f"{'File':<40} {'Size':>10} {'Packets':>10} {'Throughput':>16} {'Elapsed':>10} {'Status':>10}"
+        f"{'PCAP File':<30} {'CSV File':<30} {'Frames':>10} {'Avg Size':>10} {'Min/Max':>12} {'Speed':>14}"
     )
-    print("-" * 100)
+    print("-" * 110)
 
     for item in results:
+        pcap_name = Path(item["pcap_file"]).name
+        csv_name = Path(item["csv_file"]).name
         if "error" in item:
-            status = "ERROR"
-            size_str = format_bytes(item["file_size_bytes"])
-            print(f"{item['file_name']:<40} {size_str:>10} {'N/A':>10} {'N/A':>16} {'N/A':>10} {status:>10}")
+            print(f"{pcap_name:<30} {csv_name:<30} {'ERROR':>10} {'N/A':>10} {'N/A':>12} {'N/A':>14}")
         else:
-            status = "OK"
-            size_str = format_bytes(item["file_size_bytes"])
+            min_max_str = f"{item['min_frame_size']}/{item['max_frame_size']}"
             pps_str = f"{item['throughput_packets_per_sec']:,.0f} pkt/s"
-            elapsed_str = f"{item['processing_time_seconds']:.2f}s"
             print(
-                f"{item['file_name']:<40} {size_str:>10} {item['packet_count']:>10,d} {pps_str:>16} {elapsed_str:>10} {status:>10}"
+                f"{pcap_name:<30} {csv_name:<30} {item['packet_count']:>10,d} "
+                f"{item['avg_frame_size']:>10.1f} {min_max_str:>12} {pps_str:>14}"
             )
 
-    print("=" * 100)
+    print("=" * 110)
     print(
-        f"Summary: {len(results)} files | {total_packets:,d} total packets | "
-        f"{format_bytes(total_file_bytes)} total size | {total_elapsed:.2f}s total time "
-        f"({overall_throughput_pps:,.0f} pkt/s, {overall_throughput_mb:.2f} MB/s)\n"
+        f"Summary: {len(results)} files converted to CSV | {total_packets:,d} total frames | "
+        f"{format_bytes(total_payload)} total data | {total_elapsed:.2f}s total time "
+        f"({overall_pps:,.0f} pkt/s, {overall_mb:.2f} MB/s)\n"
     )
 
 

@@ -4,7 +4,8 @@ __pycache__/
 *.pcap
 *.pcapng
 *.cap
+*.csv
+Dataset/
 .pytest_cache/
 .vscode/
 .idea/
-
