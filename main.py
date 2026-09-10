@@ -30,6 +30,7 @@ try:
     from protocol_layer.ADD_ADDR import extract_add_addr_to_csv
     from protocol_layer.REMOVE_ADDR import extract_remove_addr_to_csv
     from protocol_layer.MP_PRIO import extract_mp_prio_to_csv
+    from protocol_layer.MP_FAIL import extract_mp_fail_to_csv
 except ImportError:
     # Fallback if running directly inside folder
     _ALT_DIR = _CURRENT_DIR / "protocol_layer"
@@ -50,6 +51,7 @@ except ImportError:
     from protocol_layer.ADD_ADDR import extract_add_addr_to_csv
     from protocol_layer.REMOVE_ADDR import extract_remove_addr_to_csv
     from protocol_layer.MP_PRIO import extract_mp_prio_to_csv
+    from protocol_layer.MP_FAIL import extract_mp_fail_to_csv
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
 
@@ -233,6 +235,18 @@ def _pcap_worker(task: tuple) -> dict:
         except Exception as exc:
             result["mp_prio_error"] = str(exc)
 
+    # 11. MP_FAIL extraction
+    if "mp_fail" in layers:
+        try:
+            mp_fail_res = extract_mp_fail_to_csv(
+                pcap_path=pcap_path,
+                output_csv_path=output_dir,
+                limit_packets=limit_packets,
+            )
+            result["mp_fail"] = mp_fail_res
+        except Exception as exc:
+            result["mp_fail_error"] = str(exc)
+
     result["total_worker_time"] = max(time.perf_counter() - t0, 1e-9)
     return result
 
@@ -309,9 +323,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--layer",
-        choices=["all", "ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio"],
+        choices=["all", "ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio", "mp_fail"],
         default="all",
-        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', 'mptcp', 'mp_capable', 'mp_join', 'dss', 'add_addr', 'remove_addr', or 'mp_prio'.",
+        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', 'mptcp', 'mp_capable', 'mp_join', 'dss', 'add_addr', 'remove_addr', 'mp_prio', or 'mp_fail'.",
     )
     parser.add_argument(
         "--output-dir",
@@ -369,7 +383,7 @@ def main() -> None:
     link_speed_bps = parse_link_speed(args.link_speed)
 
     if args.layer == "all":
-        selected_layers = ("ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio")
+        selected_layers = ("ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio", "mp_fail")
     elif args.layer == "ethernet":
         selected_layers = ("ethernet",)
     elif args.layer == "ip":
@@ -388,8 +402,10 @@ def main() -> None:
         selected_layers = ("add_addr",)
     elif args.layer == "remove_addr":
         selected_layers = ("remove_addr",)
-    else:
+    elif args.layer == "mp_prio":
         selected_layers = ("mp_prio",)
+    else:
+        selected_layers = ("mp_fail",)
 
     t_start = time.perf_counter()
     results = process_folder_protocol_layers(
@@ -436,6 +452,8 @@ def main() -> None:
         header_cols += f"{'REMOVE_ADDR CSV':<24} {'Events':>8} "
     if "mp_prio" in selected_layers:
         header_cols += f"{'MP_PRIO CSV':<24} {'Events':>8} "
+    if "mp_fail" in selected_layers:
+        header_cols += f"{'MP_FAIL CSV':<24} {'Events':>8} "
     header_cols += f"{'Speed':>14} {'Status':>8}"
 
     print(header_cols)
@@ -552,6 +570,16 @@ def main() -> None:
             if mp_prio_info:
                 csv_name = Path(mp_prio_info["csv_file"]).name
                 events_cnt = mp_prio_info["mp_prio_events"]
+                row_str += f"{csv_name:<24} {events_cnt:>8,d} "
+            else:
+                row_str += f"{'ERROR':<24} {'N/A':>8} "
+                status = "ERR"
+
+        if "mp_fail" in selected_layers:
+            mp_fail_info = item.get("mp_fail")
+            if mp_fail_info:
+                csv_name = Path(mp_fail_info["csv_file"]).name
+                events_cnt = mp_fail_info["mp_fail_events"]
                 row_str += f"{csv_name:<24} {events_cnt:>8,d} "
             else:
                 row_str += f"{'ERROR':<24} {'N/A':>8} "
