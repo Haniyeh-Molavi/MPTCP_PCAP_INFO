@@ -28,6 +28,7 @@ try:
     from protocol_layer.MP_JOIN import extract_mp_join_to_csv
     from protocol_layer.DSS import extract_dss_to_csv
     from protocol_layer.ADD_ADDR import extract_add_addr_to_csv
+    from protocol_layer.REMOVE_ADDR import extract_remove_addr_to_csv
 except ImportError:
     # Fallback if running directly inside folder
     _ALT_DIR = _CURRENT_DIR / "protocol_layer"
@@ -46,6 +47,7 @@ except ImportError:
     from protocol_layer.MP_JOIN import extract_mp_join_to_csv
     from protocol_layer.DSS import extract_dss_to_csv
     from protocol_layer.ADD_ADDR import extract_add_addr_to_csv
+    from protocol_layer.REMOVE_ADDR import extract_remove_addr_to_csv
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
 
@@ -205,6 +207,18 @@ def _pcap_worker(task: tuple) -> dict:
         except Exception as exc:
             result["add_addr_error"] = str(exc)
 
+    # 9. REMOVE_ADDR extraction
+    if "remove_addr" in layers:
+        try:
+            remove_addr_res = extract_remove_addr_to_csv(
+                pcap_path=pcap_path,
+                output_csv_path=output_dir,
+                limit_packets=limit_packets,
+            )
+            result["remove_addr"] = remove_addr_res
+        except Exception as exc:
+            result["remove_addr_error"] = str(exc)
+
     result["total_worker_time"] = max(time.perf_counter() - t0, 1e-9)
     return result
 
@@ -281,9 +295,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--layer",
-        choices=["all", "ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr"],
+        choices=["all", "ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr"],
         default="all",
-        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', 'mptcp', 'mp_capable', 'mp_join', 'dss', or 'add_addr'.",
+        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', 'mptcp', 'mp_capable', 'mp_join', 'dss', 'add_addr', or 'remove_addr'.",
     )
     parser.add_argument(
         "--output-dir",
@@ -341,7 +355,7 @@ def main() -> None:
     link_speed_bps = parse_link_speed(args.link_speed)
 
     if args.layer == "all":
-        selected_layers = ("ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr")
+        selected_layers = ("ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr")
     elif args.layer == "ethernet":
         selected_layers = ("ethernet",)
     elif args.layer == "ip":
@@ -356,8 +370,10 @@ def main() -> None:
         selected_layers = ("mp_join",)
     elif args.layer == "dss":
         selected_layers = ("dss",)
-    else:
+    elif args.layer == "add_addr":
         selected_layers = ("add_addr",)
+    else:
+        selected_layers = ("remove_addr",)
 
     t_start = time.perf_counter()
     results = process_folder_protocol_layers(
@@ -400,6 +416,8 @@ def main() -> None:
         header_cols += f"{'DSS CSV':<24} {'Events':>8} "
     if "add_addr" in selected_layers:
         header_cols += f"{'ADD_ADDR CSV':<24} {'Events':>8} "
+    if "remove_addr" in selected_layers:
+        header_cols += f"{'REMOVE_ADDR CSV':<24} {'Events':>8} "
     header_cols += f"{'Speed':>14} {'Status':>8}"
 
     print(header_cols)
@@ -496,6 +514,16 @@ def main() -> None:
             if add_addr_info:
                 csv_name = Path(add_addr_info["csv_file"]).name
                 events_cnt = add_addr_info["add_addr_events"]
+                row_str += f"{csv_name:<24} {events_cnt:>8,d} "
+            else:
+                row_str += f"{'ERROR':<24} {'N/A':>8} "
+                status = "ERR"
+
+        if "remove_addr" in selected_layers:
+            remove_addr_info = item.get("remove_addr")
+            if remove_addr_info:
+                csv_name = Path(remove_addr_info["csv_file"]).name
+                events_cnt = remove_addr_info["remove_addr_events"]
                 row_str += f"{csv_name:<24} {events_cnt:>8,d} "
             else:
                 row_str += f"{'ERROR':<24} {'N/A':>8} "
