@@ -24,6 +24,8 @@ try:
     from protocol_layer.ip import extract_ip_to_csv
     from protocol_layer.tcp import extract_tcp_to_csv
     from protocol_layer.mptcp_level import extract_mptcp_to_csv
+    from protocol_layer.MP_CAPABLE import extract_mp_capable_to_csv
+    from protocol_layer.MP_JOIN import extract_mp_join_to_csv
 except ImportError:
     # Fallback if running directly inside folder
     _ALT_DIR = _CURRENT_DIR / "protocol_layer"
@@ -38,6 +40,8 @@ except ImportError:
     from protocol_layer.ip import extract_ip_to_csv
     from protocol_layer.tcp import extract_tcp_to_csv
     from protocol_layer.mptcp_level import extract_mptcp_to_csv
+    from protocol_layer.MP_CAPABLE import extract_mp_capable_to_csv
+    from protocol_layer.MP_JOIN import extract_mp_join_to_csv
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
 
@@ -149,6 +153,30 @@ def _pcap_worker(task: tuple) -> dict:
         except Exception as exc:
             result["mptcp_error"] = str(exc)
 
+    # 5. MP_CAPABLE extraction
+    if "mp_capable" in layers:
+        try:
+            mp_capable_res = extract_mp_capable_to_csv(
+                pcap_path=pcap_path,
+                output_csv_path=output_dir,
+                limit_packets=limit_packets,
+            )
+            result["mp_capable"] = mp_capable_res
+        except Exception as exc:
+            result["mp_capable_error"] = str(exc)
+
+    # 6. MP_JOIN extraction
+    if "mp_join" in layers:
+        try:
+            mp_join_res = extract_mp_join_to_csv(
+                pcap_path=pcap_path,
+                output_csv_path=output_dir,
+                limit_packets=limit_packets,
+            )
+            result["mp_join"] = mp_join_res
+        except Exception as exc:
+            result["mp_join_error"] = str(exc)
+
     result["total_worker_time"] = max(time.perf_counter() - t0, 1e-9)
     return result
 
@@ -225,9 +253,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--layer",
-        choices=["all", "ethernet", "ip", "tcp", "mptcp"],
+        choices=["all", "ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join"],
         default="all",
-        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', or 'mptcp'.",
+        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', 'mptcp', 'mp_capable', or 'mp_join'.",
     )
     parser.add_argument(
         "--output-dir",
@@ -285,15 +313,19 @@ def main() -> None:
     link_speed_bps = parse_link_speed(args.link_speed)
 
     if args.layer == "all":
-        selected_layers = ("ethernet", "ip", "tcp", "mptcp")
+        selected_layers = ("ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join")
     elif args.layer == "ethernet":
         selected_layers = ("ethernet",)
     elif args.layer == "ip":
         selected_layers = ("ip",)
     elif args.layer == "tcp":
         selected_layers = ("tcp",)
-    else:
+    elif args.layer == "mptcp":
         selected_layers = ("mptcp",)
+    elif args.layer == "mp_capable":
+        selected_layers = ("mp_capable",)
+    else:
+        selected_layers = ("mp_join",)
 
     t_start = time.perf_counter()
     results = process_folder_protocol_layers(
@@ -328,6 +360,10 @@ def main() -> None:
         header_cols += f"{'TCP CSV':<24} {'TCP Pkts':>8} {'Flows':>6} "
     if "mptcp" in selected_layers:
         header_cols += f"{'MPTCP CSV':<24} {'MPTCP Pkts':>10} {'Conns':>6} "
+    if "mp_capable" in selected_layers:
+        header_cols += f"{'MP_CAPABLE CSV':<24} {'Sessions':>8} "
+    if "mp_join" in selected_layers:
+        header_cols += f"{'MP_JOIN CSV':<24} {'Events':>8} "
     header_cols += f"{'Speed':>14} {'Status':>8}"
 
     print(header_cols)
@@ -387,6 +423,26 @@ def main() -> None:
                 row_str += f"{csv_name:<24} {cnt:>10,d} {conns_cnt:>6d} "
             else:
                 row_str += f"{'ERROR':<24} {'N/A':>10} {'N/A':>6} "
+                status = "ERR"
+
+        if "mp_capable" in selected_layers:
+            mp_capable_info = item.get("mp_capable")
+            if mp_capable_info:
+                csv_name = Path(mp_capable_info["csv_file"]).name
+                sessions_cnt = mp_capable_info["session_count"]
+                row_str += f"{csv_name:<24} {sessions_cnt:>8,d} "
+            else:
+                row_str += f"{'ERROR':<24} {'N/A':>8} "
+                status = "ERR"
+
+        if "mp_join" in selected_layers:
+            mp_join_info = item.get("mp_join")
+            if mp_join_info:
+                csv_name = Path(mp_join_info["csv_file"]).name
+                events_cnt = mp_join_info["mp_join_events"]
+                row_str += f"{csv_name:<24} {events_cnt:>8,d} "
+            else:
+                row_str += f"{'ERROR':<24} {'N/A':>8} "
                 status = "ERR"
 
         worker_time = item.get("total_worker_time", 1.0)
