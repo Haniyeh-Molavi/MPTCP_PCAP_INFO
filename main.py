@@ -33,6 +33,7 @@ try:
     from protocol_layer.MP_FAIL import extract_mp_fail_to_csv
     from protocol_layer.MP_FASTCLOSE import extract_mp_fastclose_to_csv
     from protocol_layer.subflow_level_statistics import extract_subflow_level_statistics_to_csv
+    from protocol_layer.mptcp_behavior import extract_mptcp_behavior_to_csv
 except ImportError:
     # Fallback if running directly inside folder
     _ALT_DIR = _CURRENT_DIR / "protocol_layer"
@@ -56,6 +57,7 @@ except ImportError:
     from protocol_layer.MP_FAIL import extract_mp_fail_to_csv
     from protocol_layer.MP_FASTCLOSE import extract_mp_fastclose_to_csv
     from protocol_layer.subflow_level_statistics import extract_subflow_level_statistics_to_csv
+    from protocol_layer.mptcp_behavior import extract_mptcp_behavior_to_csv
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
 
@@ -275,6 +277,19 @@ def _pcap_worker(task: tuple) -> dict:
         except Exception as exc:
             result["subflow_level_statistics_error"] = str(exc)
 
+    # 14. MPTCP Behavior extraction
+    if "mptcp_behavior" in layers:
+        try:
+            behavior_res = extract_mptcp_behavior_to_csv(
+                pcap_path=pcap_path,
+                output_csv_path=output_dir,
+                limit_packets=limit_packets,
+                link_speed_bps=link_speed_bps,
+            )
+            result["mptcp_behavior"] = behavior_res
+        except Exception as exc:
+            result["mptcp_behavior_error"] = str(exc)
+
     result["total_worker_time"] = max(time.perf_counter() - t0, 1e-9)
     return result
 
@@ -351,9 +366,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--layer",
-        choices=["all", "ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio", "mp_fail", "mp_fastclose", "subflow_level_statistics"],
+        choices=["all", "ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio", "mp_fail", "mp_fastclose", "subflow_level_statistics", "mptcp_behavior"],
         default="all",
-        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', 'mptcp', 'mp_capable', 'mp_join', 'dss', 'add_addr', 'remove_addr', 'mp_prio', 'mp_fail', 'mp_fastclose', or 'subflow_level_statistics'.",
+        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', 'mptcp', 'mp_capable', 'mp_join', 'dss', 'add_addr', 'remove_addr', 'mp_prio', 'mp_fail', 'mp_fastclose', 'subflow_level_statistics', or 'mptcp_behavior'.",
     )
     parser.add_argument(
         "--output-dir",
@@ -411,7 +426,7 @@ def main() -> None:
     link_speed_bps = parse_link_speed(args.link_speed)
 
     if args.layer == "all":
-        selected_layers = ("ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio", "mp_fail", "mp_fastclose", "subflow_level_statistics")
+        selected_layers = ("ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio", "mp_fail", "mp_fastclose", "subflow_level_statistics", "mptcp_behavior")
     elif args.layer == "ethernet":
         selected_layers = ("ethernet",)
     elif args.layer == "ip":
@@ -436,6 +451,10 @@ def main() -> None:
         selected_layers = ("mp_fail",)
     elif args.layer == "mp_fastclose":
         selected_layers = ("mp_fastclose",)
+    elif args.layer == "subflow_level_statistics":
+        selected_layers = ("subflow_level_statistics",)
+    elif args.layer == "mptcp_behavior":
+        selected_layers = ("mptcp_behavior",)
     else:
         selected_layers = ("subflow_level_statistics",)
 
@@ -490,6 +509,8 @@ def main() -> None:
         header_cols += f"{'MP_FASTCLOSE CSV':<24} {'Events':>8} "
     if "subflow_level_statistics" in selected_layers:
         header_cols += f"{'SUBFLOW CSV':<24} {'Subflows':>8} "
+    if "mptcp_behavior" in selected_layers:
+        header_cols += f"{'MPTCP BEHAVIOR CSV':<24} {'Conns':>6} "
     header_cols += f"{'Speed':>14} {'Status':>8}"
 
     print(header_cols)
@@ -639,6 +660,16 @@ def main() -> None:
                 row_str += f"{csv_name:<24} {subflow_cnt:>8,d} "
             else:
                 row_str += f"{'ERROR':<24} {'N/A':>8} "
+                status = "ERR"
+
+        if "mptcp_behavior" in selected_layers:
+            behavior_info = item.get("mptcp_behavior")
+            if behavior_info:
+                csv_name = Path(behavior_info["csv_file"]).name
+                behavior_cnt = behavior_info["connections"]
+                row_str += f"{csv_name:<24} {behavior_cnt:>6,d} "
+            else:
+                row_str += f"{'ERROR':<24} {'N/A':>6} "
                 status = "ERR"
 
         worker_time = item.get("total_worker_time", 1.0)
