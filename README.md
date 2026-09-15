@@ -214,6 +214,48 @@ Each row contains `Minimum DSN`, `Maximum DSN`, `Final DSN`, `Data ACK Values`,
 `DATA_FIN Presence`, and `DSN Range`. `Final DSN` is the last DSN observed in
 capture order, while `DSN Range` is `Maximum DSN - Minimum DSN`.
 
+### 14. Extract Throughput Features
+The `throughput` layer calculates connection-level throughput metrics and saves
+one CSV per PCAP using the suffix `_throughput.csv`:
+
+```powershell
+# Process every capture in Dataset:
+python main.py Dataset --layer throughput
+
+# Save the generated CSV files in outputs:
+python main.py Dataset --layer throughput --output-dir outputs
+
+# Run a quick sample:
+python main.py Dataset --layer throughput --limit 1000 --workers 1
+```
+
+Each row contains `Average Throughput`, `Peak Throughput`, `Minimum
+Throughput`, `Goodput`, and `Payload Efficiency`. Throughput and goodput are
+bytes per second. Peak and minimum throughput use the per-packet interval rates;
+payload efficiency is the unique delivered MPTCP payload divided by total frame
+bytes, expressed as a percentage.
+
+### 15. Extract Reliability Features
+The `reliability` layer calculates TCP reliability metrics and saves one CSV per
+PCAP using the suffix `_reliability.csv`:
+
+```powershell
+# Process every capture in Dataset:
+python main.py Dataset --layer reliability
+
+# Save the generated CSV files in outputs:
+python main.py Dataset --layer reliability --output-dir outputs
+
+# Run a quick sample:
+python main.py Dataset --layer reliability --limit 1000 --workers 1
+```
+
+Each row represents one TCP flow and contains `Retransmitted Bytes`,
+`Retransmitted Packets`, `Retransmission Ratio`, `Duplicate ACK Count`,
+`Out-of-Order Data Count`, `Data Reordering Rate`, and `Lost Packet Estimate`.
+The lost-packet estimate is based on detected retransmitted packets; ratios are
+reported as decimal fractions.
+
 ---
 
 ## Command-Line Arguments Reference
