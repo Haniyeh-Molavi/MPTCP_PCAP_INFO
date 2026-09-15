@@ -174,6 +174,27 @@ python main.py Dataset --layer ethernet
 python main.py Dataset --layer timing
 ```
 
+### 12. Extract Traffic Volume Features
+The `traffic_volume` layer calculates traffic totals for each detected MPTCP
+connection and saves one CSV per PCAP using the suffix
+`_traffic_volume.csv`:
+
+```powershell
+# Process every capture in Dataset:
+python main.py Dataset --layer traffic_volume
+
+# Save the generated CSV files in outputs:
+python main.py Dataset --layer traffic_volume --output-dir outputs
+
+# Run a quick sample:
+python main.py Dataset --layer traffic_volume --limit 1000 --workers 1
+```
+
+Each row contains `Total Packets Sent`, `Total Packets Received`, `Total
+Packets`, `Total Bytes Sent`, `Total Bytes Received`, `Total Bytes`, and `Total
+Payload Bytes`. The sent direction is the direction of the first packet seen for
+the connection; payload bytes are the MPTCP data payload bytes.
+
 ---
 
 ## Command-Line Arguments Reference
