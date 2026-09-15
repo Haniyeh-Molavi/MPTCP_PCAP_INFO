@@ -256,6 +256,27 @@ Each row represents one TCP flow and contains `Retransmitted Bytes`,
 The lost-packet estimate is based on detected retransmitted packets; ratios are
 reported as decimal fractions.
 
+### 16. Extract Delay Features
+The `delay` layer calculates TCP round-trip-time and jitter metrics and saves one
+CSV per PCAP using the suffix `_delay.csv`:
+
+```powershell
+# Process every capture in Dataset:
+python main.py Dataset --layer delay
+
+# Save the generated CSV files in outputs:
+python main.py Dataset --layer delay --output-dir outputs
+
+# Run a quick sample:
+python main.py Dataset --layer delay --limit 1000 --workers 1
+```
+
+Each row represents one TCP flow and contains `Average RTT`, `Minimum RTT`,
+`Maximum RTT`, `RTT Variance`, `RTT Standard Deviation`, and `Jitter`. RTT and
+jitter values are in seconds. RTT variance uses the sample variance of matched
+TCP acknowledgment samples, and jitter is the mean absolute difference between
+consecutive RTT samples.
+
 ---
 
 ## Command-Line Arguments Reference
