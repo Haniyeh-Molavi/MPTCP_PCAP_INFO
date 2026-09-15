@@ -15,23 +15,19 @@ try:
     from protocol_layer.ethernet import stream_pcap_packets
     from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
 except ImportError:
-    try:
-        from protocol_layer.ethernet import stream_pcap_packets
-        from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
-    except ImportError:
-        import dpkt
+    import dpkt
 
-        def stream_pcap_packets(file_path: Path | str):
-            with open(file_path, "rb") as f:
-                reader = dpkt.pcap.Reader(f)
-                for ts, pkt in reader:
-                    yield float(ts), pkt
+    def stream_pcap_packets(file_path: Path | str):
+        with open(file_path, "rb") as f:
+            reader = dpkt.pcap.Reader(f)
+            for ts, pkt in reader:
+                yield float(ts), pkt
 
-        def parse_mptcp_packet(packet_bytes: bytes):
-            return None
+    def parse_mptcp_packet(_packet_bytes: bytes):
+        return None
 
-        def compute_mptcp_token(key_bytes: bytes) -> str:
-            return ""
+    def compute_mptcp_token(_key_bytes: bytes) -> str:
+        return ""
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
 
@@ -54,22 +50,18 @@ class ConnectionTimingState:
             self.last_data_time = ts
 
 
-def _resolve_connection_id(parsed: dict, token_to_conn: dict[str, str], endpoint_to_conn: dict[tuple[str, int, str, int], str], next_index: int) -> tuple[str, int]:
+def _resolve_connection_id(parsed: dict, endpoint_to_conn: dict[tuple[str, int, str, int], str], next_index: int) -> tuple[str, int]:
     sender_key = parsed.get("sender_key")
     receiver_key = parsed.get("receiver_key")
 
     if sender_key:
         token = compute_mptcp_token(sender_key)
         if token:
-            if token not in token_to_conn:
-                token_to_conn[token] = token
             return token, next_index
 
     if receiver_key:
         token = compute_mptcp_token(receiver_key)
         if token:
-            if token not in token_to_conn:
-                token_to_conn[token] = token
             return token, next_index
 
     endpoint_key = (
@@ -112,7 +104,6 @@ def extract_connection_timing_to_csv(
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     connections: dict[str, ConnectionTimingState] = {}
-    token_to_conn: dict[str, str] = {}
     endpoint_to_conn: dict[tuple[str, int, str, int], str] = {}
     next_index = 1
     packet_count = 0
@@ -134,7 +125,6 @@ def extract_connection_timing_to_csv(
 
         conn_id, next_index = _resolve_connection_id(
             parsed=parsed,
-            token_to_conn=token_to_conn,
             endpoint_to_conn=endpoint_to_conn,
             next_index=next_index,
         )
@@ -211,7 +201,10 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Extract per-connection timing metrics from one or more PCAP files into CSV."
+        description=(
+            "Extract per-connection timing metrics from one or more PCAP files into CSV. "
+            "The same extractor is available through 'python main.py --layer timing'."
+        )
     )
     parser.add_argument("input", help="PCAP file or folder containing PCAP files.")
     parser.add_argument(
@@ -228,6 +221,9 @@ def main() -> None:
         help="Maximum number of packets to process per file.",
     )
     args = parser.parse_args()
+
+    if args.output_dir is not None:
+        Path(args.output_dir).expanduser().resolve().mkdir(parents=True, exist_ok=True)
 
     input_path = Path(args.input).expanduser().resolve()
 

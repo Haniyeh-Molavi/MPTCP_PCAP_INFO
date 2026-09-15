@@ -117,12 +117,45 @@ python protocol_layer/ip.py "Dataset\mptcp-dump_20150308_21403700.pcap"
 
 # TCP Layer extractor:
 python protocol_layer/tcp.py "Dataset\mptcp-dump_20150308_21403700.pcap"
+
+# Connection timing extractor:
+python connection_level/timing.py "Dataset\mptcp-dump_20150308_21403700.pcap"
 ```
+
+The timing extractor writes a per-connection CSV named
+`[pcap_name]_connection_timing.csv`. When a folder is provided, it processes all
+PCAP, CAP, and PCAPNG files under that folder recursively.
 
 ---
 
-### 10. Select Specific Protocol Layers in main.py
-Control which protocol layers are extracted via the `--layer` flag (`all`, `ethernet`, `ip`, or `tcp`):
+### 10. Run Timing Through main.py
+Use the `timing` layer to run connection timing through the main workflow. It
+supports folder scanning, parallel workers, custom output directories, packet
+limits, and JSON summaries:
+
+```powershell
+# Process every capture in Dataset:
+python main.py Dataset --layer timing
+
+# Process every capture and save the timing CSVs in outputs:
+python main.py Dataset --layer timing --output-dir outputs
+
+# Process a small sample for a quick test:
+python main.py Dataset --layer timing --limit 1000 --workers 1
+
+# Print machine-readable results:
+python main.py Dataset --layer timing --json
+```
+
+The timing output contains one row per detected MPTCP connection with its
+start/end times, connection duration, first and last data timestamps, and data
+transfer duration. The older `connection_timing` layer name remains supported
+as an alias.
+
+---
+
+### 11. Select Specific Protocol Layers in main.py
+Control which protocol layers are extracted via the `--layer` flag:
 
 ```powershell
 # Extract all layers (default: Ethernet, IP, and TCP):
@@ -136,6 +169,9 @@ python main.py Dataset --layer ip
 
 # Extract only Ethernet layer features:
 python main.py Dataset --layer ethernet
+
+# Extract only connection timing features:
+python main.py Dataset --layer timing
 ```
 
 ---

@@ -15,28 +15,21 @@ try:
     from protocol_layer.ethernet import stream_pcap_packets
     from protocol_layer.mptcp_level import compute_mptcp_token
 except ImportError:
-    try:
-        from protocol_layer.ethernet import stream_pcap_packets
-        from protocol_layer.mptcp_level import compute_mptcp_token
-    except ImportError:
-        import dpkt
+    import dpkt
 
-        def stream_pcap_packets(file_path: Path | str):
-            with open(file_path, "rb") as f:
-                reader = dpkt.pcap.Reader(f)
-                for ts, pkt in reader:
-                    yield float(ts), pkt
+    def stream_pcap_packets(file_path: Path | str):
+        with open(file_path, "rb") as f:
+            reader = dpkt.pcap.Reader(f)
+            for ts, pkt in reader:
+                yield float(ts), pkt
 
-        def compute_mptcp_token(key_bytes: bytes) -> str:
-            return ""
+    def compute_mptcp_token(_key_bytes: bytes) -> str:
+        return ""
 
 try:
     from protocol_layer.MP_CAPABLE import parse_mp_capable_packet
 except ImportError:
-    try:
-        from MP_CAPABLE import parse_mp_capable_packet
-    except ImportError:
-        def parse_mp_capable_packet(packet_bytes: bytes):
+        def parse_mp_capable_packet(_packet_bytes: bytes):
             return None
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
@@ -46,7 +39,6 @@ class ConnectionIdentityState:
     def __init__(self, connection_id: str, start_ts: float) -> None:
         self.connection_id = connection_id
         self.start_ts = start_ts
-        self.last_ts = start_ts
         self.sender_key = None
         self.receiver_key = None
         self.local_token = ""
@@ -124,8 +116,6 @@ def extract_connection_identity_to_csv(
                 connection_id = f"conn_{len(connection_states) + 1}"
             state = ConnectionIdentityState(connection_id=connection_id, start_ts=ts)
             connection_states[key] = state
-
-        state.last_ts = ts
 
         if parsed.get("sender_key") is not None:
             state.sender_key = parsed["sender_key"]

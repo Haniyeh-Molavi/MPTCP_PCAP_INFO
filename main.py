@@ -116,6 +116,8 @@ def _pcap_worker(task: tuple) -> dict:
     pcap_path_str, output_dir_str, link_speed_bps, limit_packets, layers = task
     pcap_path = Path(pcap_path_str)
     output_dir = Path(output_dir_str) if output_dir_str else None
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     result: dict = {
         "pcap_file": str(pcap_path),
@@ -396,7 +398,7 @@ def main() -> None:
         "--layer",
         choices=["all", "ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio", "mp_fail", "mp_fastclose", "subflow_level_statistics", "mptcp_behavior", "connection_identity", "connection_timing"],
         default="all",
-        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', 'mptcp', 'mp_capable', 'mp_join', 'dss', 'add_addr', 'remove_addr', 'mp_prio', 'mp_fail', 'mp_fastclose', 'subflow_level_statistics', 'mptcp_behavior', 'connection_identity', or 'connection_timing'.",
+        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', 'mptcp', 'mp_capable', 'mp_join', 'dss', 'add_addr', 'remove_addr', 'mp_prio', 'mp_fail', 'mp_fastclose', 'subflow_level_statistics', 'mptcp_behavior', 'connection_identity', 'timing', or 'connection_timing'.",
     )
     parser.add_argument(
         "--output-dir",
@@ -485,7 +487,7 @@ def main() -> None:
         selected_layers = ("mptcp_behavior",)
     elif args.layer == "connection_identity":
         selected_layers = ("connection_identity",)
-    elif args.layer == "connection_timing":
+    elif args.layer in {"timing", "connection_timing"}:
         selected_layers = ("connection_timing",)
     else:
         selected_layers = ("subflow_level_statistics",)
@@ -556,6 +558,7 @@ def main() -> None:
     total_ip_pkts = 0
     total_tcp_pkts = 0
     total_mptcp_pkts = 0
+    total_timing_pkts = 0
 
     for item in results:
         pcap_name = item["pcap_name"]
@@ -708,8 +711,19 @@ def main() -> None:
                 row_str += f"{'ERROR':<24} {'N/A':>6} "
                 status = "ERR"
 
+        if "connection_timing" in selected_layers:
+            timing_info = item.get("connection_timing")
+            if timing_info:
+                csv_name = Path(timing_info["csv_file"]).name
+                timing_cnt = timing_info["connection_count"]
+                total_timing_pkts += timing_info["packet_count"]
+                row_str += f"{csv_name:<24} {timing_cnt:>6,d} "
+            else:
+                row_str += f"{'ERROR':<24} {'N/A':>6} "
+                status = "ERR"
+
         worker_time = item.get("total_worker_time", 1.0)
-        pps = (total_frames or total_ip_pkts or total_tcp_pkts or total_mptcp_pkts) / max(worker_time, 1e-9)
+        pps = (total_frames or total_ip_pkts or total_tcp_pkts or total_mptcp_pkts or total_timing_pkts) / max(worker_time, 1e-9)
         pps_str = f"{pps:,.0f} pkt/s"
         row_str += f"{pps_str:>14} {status:>8}"
         print(row_str)
