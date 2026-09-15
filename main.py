@@ -26,7 +26,7 @@ try:
     from protocol_layer.mptcp_level import extract_mptcp_to_csv
     from protocol_layer.MP_CAPABLE import extract_mp_capable_to_csv
     from protocol_layer.MP_JOIN import extract_mp_join_to_csv
-    from protocol_layer.DSS import extract_dss_to_csv
+    from connection_level.dss import extract_dss_to_csv
     from protocol_layer.ADD_ADDR import extract_add_addr_to_csv
     from protocol_layer.REMOVE_ADDR import extract_remove_addr_to_csv
     from protocol_layer.MP_PRIO import extract_mp_prio_to_csv
@@ -53,7 +53,7 @@ except ImportError:
     from protocol_layer.mptcp_level import extract_mptcp_to_csv
     from protocol_layer.MP_CAPABLE import extract_mp_capable_to_csv
     from protocol_layer.MP_JOIN import extract_mp_join_to_csv
-    from protocol_layer.DSS import extract_dss_to_csv
+    from connection_level.dss import extract_dss_to_csv
     from protocol_layer.ADD_ADDR import extract_add_addr_to_csv
     from protocol_layer.REMOVE_ADDR import extract_remove_addr_to_csv
     from protocol_layer.MP_PRIO import extract_mp_prio_to_csv
@@ -576,6 +576,7 @@ def main() -> None:
     total_ip_pkts = 0
     total_tcp_pkts = 0
     total_mptcp_pkts = 0
+    total_dss_events = 0
     total_timing_pkts = 0
     total_traffic_volume_pkts = 0
 
@@ -655,6 +656,7 @@ def main() -> None:
             if dss_info:
                 csv_name = Path(dss_info["csv_file"]).name
                 events_cnt = dss_info["dss_events"]
+                total_dss_events += events_cnt
                 row_str += f"{csv_name:<24} {events_cnt:>8,d} "
             else:
                 row_str += f"{'ERROR':<24} {'N/A':>8} "
@@ -753,7 +755,7 @@ def main() -> None:
                 status = "ERR"
 
         worker_time = item.get("total_worker_time", 1.0)
-        pps = (total_frames or total_ip_pkts or total_tcp_pkts or total_mptcp_pkts or total_timing_pkts or total_traffic_volume_pkts) / max(worker_time, 1e-9)
+        pps = (total_frames or total_ip_pkts or total_tcp_pkts or total_mptcp_pkts or total_dss_events or total_timing_pkts or total_traffic_volume_pkts) / max(worker_time, 1e-9)
         pps_str = f"{pps:,.0f} pkt/s"
         row_str += f"{pps_str:>14} {status:>8}"
         print(row_str)

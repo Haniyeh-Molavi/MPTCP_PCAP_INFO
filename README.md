@@ -195,6 +195,25 @@ Packets`, `Total Bytes Sent`, `Total Bytes Received`, `Total Bytes`, and `Total
 Payload Bytes`. The sent direction is the direction of the first packet seen for
 the connection; payload bytes are the MPTCP data payload bytes.
 
+### 13. Extract DSS Features
+The `dss` layer aggregates Data Sequence Signal values per connection and saves
+one CSV per PCAP using the suffix `_dss.csv`:
+
+```powershell
+# Process every capture in Dataset:
+python main.py Dataset --layer dss
+
+# Save the generated CSV files in outputs:
+python main.py Dataset --layer dss --output-dir outputs
+
+# Run a quick sample:
+python main.py Dataset --layer dss --limit 1000 --workers 1
+```
+
+Each row contains `Minimum DSN`, `Maximum DSN`, `Final DSN`, `Data ACK Values`,
+`DATA_FIN Presence`, and `DSN Range`. `Final DSN` is the last DSN observed in
+capture order, while `DSN Range` is `Maximum DSN - Minimum DSN`.
+
 ---
 
 ## Command-Line Arguments Reference
