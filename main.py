@@ -27,6 +27,7 @@ try:
     from protocol_layer.MP_CAPABLE import extract_mp_capable_to_csv
     from protocol_layer.MP_JOIN import extract_mp_join_to_csv
     from connection_level.dss import extract_dss_to_csv
+    from connection_level.dss_metrics import extract_dss_metrics_to_csv
     from protocol_layer.ADD_ADDR import extract_add_addr_to_csv
     from protocol_layer.REMOVE_ADDR import extract_remove_addr_to_csv
     from protocol_layer.MP_PRIO import extract_mp_prio_to_csv
@@ -58,6 +59,7 @@ except ImportError:
     from protocol_layer.MP_CAPABLE import extract_mp_capable_to_csv
     from protocol_layer.MP_JOIN import extract_mp_join_to_csv
     from connection_level.dss import extract_dss_to_csv
+    from connection_level.dss_metrics import extract_dss_metrics_to_csv
     from protocol_layer.ADD_ADDR import extract_add_addr_to_csv
     from protocol_layer.REMOVE_ADDR import extract_remove_addr_to_csv
     from protocol_layer.MP_PRIO import extract_mp_prio_to_csv
@@ -221,7 +223,19 @@ def _pcap_worker(task: tuple) -> dict:
         except Exception as exc:
             result["dss_error"] = str(exc)
 
-    # 8. ADD_ADDR extraction
+    # 8. Aggregate DSS metrics extraction
+    if "dss_metrics" in layers:
+        try:
+            dss_metrics_res = extract_dss_metrics_to_csv(
+                pcap_path=pcap_path,
+                output_csv_path=output_dir,
+                limit_packets=limit_packets,
+            )
+            result["dss_metrics"] = dss_metrics_res
+        except Exception as exc:
+            result["dss_metrics_error"] = str(exc)
+
+    # 9. ADD_ADDR extraction
     if "add_addr" in layers:
         try:
             add_addr_res = extract_add_addr_to_csv(
@@ -466,9 +480,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--layer",
-        choices=["all", "ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio", "mp_fail", "mp_fastclose", "subflow_level_statistics", "mptcp_behavior", "connection_identity", "connection_timing", "traffic_volume", "throughput", "reliability", "delay", "flow_activity"],
+        choices=["all", "ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "dss_metrics", "add_addr", "remove_addr", "mp_prio", "mp_fail", "mp_fastclose", "subflow_level_statistics", "mptcp_behavior", "connection_identity", "connection_timing", "traffic_volume", "throughput", "reliability", "delay", "flow_activity"],
         default="all",
-        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', 'mptcp', 'mp_capable', 'mp_join', 'dss', 'add_addr', 'remove_addr', 'mp_prio', 'mp_fail', 'mp_fastclose', 'subflow_level_statistics', 'mptcp_behavior', 'connection_identity', 'timing', 'connection_timing', 'traffic_volume', 'throughput', 'reliability', 'delay', or 'flow_activity'.",
+        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', 'mptcp', 'mp_capable', 'mp_join', 'dss', 'dss_metrics', 'add_addr', 'remove_addr', 'mp_prio', 'mp_fail', 'mp_fastclose', 'subflow_level_statistics', 'mptcp_behavior', 'connection_identity', 'timing', 'connection_timing', 'traffic_volume', 'throughput', 'reliability', 'delay', or 'flow_activity'.",
     )
     parser.add_argument(
         "--output-dir",
@@ -526,7 +540,7 @@ def main() -> None:
     link_speed_bps = parse_link_speed(args.link_speed)
 
     if args.layer == "all":
-        selected_layers = ("ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio", "mp_fail", "mp_fastclose", "subflow_level_statistics", "mptcp_behavior", "connection_identity", "connection_timing", "traffic_volume", "throughput", "reliability", "delay", "flow_activity")
+        selected_layers = ("ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "dss_metrics", "add_addr", "remove_addr", "mp_prio", "mp_fail", "mp_fastclose", "subflow_level_statistics", "mptcp_behavior", "connection_identity", "connection_timing", "traffic_volume", "throughput", "reliability", "delay", "flow_activity")
     elif args.layer == "ethernet":
         selected_layers = ("ethernet",)
     elif args.layer == "ip":
@@ -541,6 +555,8 @@ def main() -> None:
         selected_layers = ("mp_join",)
     elif args.layer == "dss":
         selected_layers = ("dss",)
+    elif args.layer == "dss_metrics":
+        selected_layers = ("dss_metrics",)
     elif args.layer == "add_addr":
         selected_layers = ("add_addr",)
     elif args.layer == "remove_addr":
@@ -611,6 +627,8 @@ def main() -> None:
         header_cols += f"{'MP_JOIN CSV':<24} {'Events':>8} "
     if "dss" in selected_layers:
         header_cols += f"{'DSS CSV':<24} {'Events':>8} "
+    if "dss_metrics" in selected_layers:
+        header_cols += f"{'DSS METRICS CSV':<24} {'Mappings':>8} "
     if "add_addr" in selected_layers:
         header_cols += f"{'ADD_ADDR CSV':<24} {'Events':>8} "
     if "remove_addr" in selected_layers:
@@ -649,6 +667,7 @@ def main() -> None:
     total_tcp_pkts = 0
     total_mptcp_pkts = 0
     total_dss_events = 0
+    total_dss_mappings = 0
     total_timing_pkts = 0
     total_traffic_volume_pkts = 0
     total_throughput_pkts = 0
@@ -734,6 +753,17 @@ def main() -> None:
                 events_cnt = dss_info["dss_events"]
                 total_dss_events += events_cnt
                 row_str += f"{csv_name:<24} {events_cnt:>8,d} "
+            else:
+                row_str += f"{'ERROR':<24} {'N/A':>8} "
+                status = "ERR"
+
+        if "dss_metrics" in selected_layers:
+            dss_metrics_info = item.get("dss_metrics")
+            if dss_metrics_info:
+                csv_name = Path(dss_metrics_info["csv_file"]).name
+                mappings_cnt = dss_metrics_info["dss_mapping_count"]
+                total_dss_mappings += mappings_cnt
+                row_str += f"{csv_name:<24} {mappings_cnt:>8,d} "
             else:
                 row_str += f"{'ERROR':<24} {'N/A':>8} "
                 status = "ERR"
