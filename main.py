@@ -40,6 +40,7 @@ try:
     from connection_level.throughput import extract_throughput_to_csv
     from connection_level.reliability import extract_reliability_to_csv
     from connection_level.delay import extract_delay_to_csv
+    from connection_level.flow_activity import extract_flow_activity_to_csv
 except ImportError:
     # Fallback if running directly inside folder
     _ALT_DIR = _CURRENT_DIR / "protocol_layer"
@@ -70,6 +71,7 @@ except ImportError:
     from connection_level.throughput import extract_throughput_to_csv
     from connection_level.reliability import extract_reliability_to_csv
     from connection_level.delay import extract_delay_to_csv
+    from connection_level.flow_activity import extract_flow_activity_to_csv
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
 
@@ -376,6 +378,18 @@ def _pcap_worker(task: tuple) -> dict:
         except Exception as exc:
             result["delay_error"] = str(exc)
 
+    # 21. Flow Activity extraction
+    if "flow_activity" in layers:
+        try:
+            flow_activity_res = extract_flow_activity_to_csv(
+                pcap_path=pcap_path,
+                output_csv_path=output_dir,
+                limit_packets=limit_packets,
+            )
+            result["flow_activity"] = flow_activity_res
+        except Exception as exc:
+            result["flow_activity_error"] = str(exc)
+
     result["total_worker_time"] = max(time.perf_counter() - t0, 1e-9)
     return result
 
@@ -452,9 +466,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--layer",
-        choices=["all", "ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio", "mp_fail", "mp_fastclose", "subflow_level_statistics", "mptcp_behavior", "connection_identity", "connection_timing", "traffic_volume", "throughput", "reliability", "delay"],
+        choices=["all", "ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio", "mp_fail", "mp_fastclose", "subflow_level_statistics", "mptcp_behavior", "connection_identity", "connection_timing", "traffic_volume", "throughput", "reliability", "delay", "flow_activity"],
         default="all",
-        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', 'mptcp', 'mp_capable', 'mp_join', 'dss', 'add_addr', 'remove_addr', 'mp_prio', 'mp_fail', 'mp_fastclose', 'subflow_level_statistics', 'mptcp_behavior', 'connection_identity', 'timing', 'connection_timing', 'traffic_volume', 'throughput', 'reliability', or 'delay'.",
+        help="Protocol layer(s) to extract: 'all' (default), 'ethernet', 'ip', 'tcp', 'mptcp', 'mp_capable', 'mp_join', 'dss', 'add_addr', 'remove_addr', 'mp_prio', 'mp_fail', 'mp_fastclose', 'subflow_level_statistics', 'mptcp_behavior', 'connection_identity', 'timing', 'connection_timing', 'traffic_volume', 'throughput', 'reliability', 'delay', or 'flow_activity'.",
     )
     parser.add_argument(
         "--output-dir",
@@ -512,7 +526,7 @@ def main() -> None:
     link_speed_bps = parse_link_speed(args.link_speed)
 
     if args.layer == "all":
-        selected_layers = ("ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio", "mp_fail", "mp_fastclose", "subflow_level_statistics", "mptcp_behavior", "connection_identity", "connection_timing", "traffic_volume", "throughput", "reliability", "delay")
+        selected_layers = ("ethernet", "ip", "tcp", "mptcp", "mp_capable", "mp_join", "dss", "add_addr", "remove_addr", "mp_prio", "mp_fail", "mp_fastclose", "subflow_level_statistics", "mptcp_behavior", "connection_identity", "connection_timing", "traffic_volume", "throughput", "reliability", "delay", "flow_activity")
     elif args.layer == "ethernet":
         selected_layers = ("ethernet",)
     elif args.layer == "ip":
@@ -553,6 +567,8 @@ def main() -> None:
         selected_layers = ("reliability",)
     elif args.layer == "delay":
         selected_layers = ("delay",)
+    elif args.layer == "flow_activity":
+        selected_layers = ("flow_activity",)
     else:
         selected_layers = ("subflow_level_statistics",)
 
@@ -621,6 +637,8 @@ def main() -> None:
         header_cols += f"{'RELIABILITY CSV':<24} {'Flows':>6} "
     if "delay" in selected_layers:
         header_cols += f"{'DELAY CSV':<24} {'Flows':>6} "
+    if "flow_activity" in selected_layers:
+        header_cols += f"{'FLOW CSV':<24} {'Flows':>6} "
     header_cols += f"{'Speed':>14} {'Status':>8}"
 
     print(header_cols)
@@ -636,6 +654,7 @@ def main() -> None:
     total_throughput_pkts = 0
     total_reliability_pkts = 0
     total_delay_pkts = 0
+    total_flow_activity_pkts = 0
 
     for item in results:
         pcap_name = item["pcap_name"]
@@ -844,8 +863,19 @@ def main() -> None:
                 row_str += f"{'ERROR':<24} {'N/A':>6} "
                 status = "ERR"
 
+        if "flow_activity" in selected_layers:
+            flow_activity_info = item.get("flow_activity")
+            if flow_activity_info:
+                csv_name = Path(flow_activity_info["csv_file"]).name
+                flow_count = flow_activity_info["connection_count"]
+                total_flow_activity_pkts += flow_activity_info["packet_count"]
+                row_str += f"{csv_name:<24} {flow_count:>6,d} "
+            else:
+                row_str += f"{'ERROR':<24} {'N/A':>6} "
+                status = "ERR"
+
         worker_time = item.get("total_worker_time", 1.0)
-        pps = (total_frames or total_ip_pkts or total_tcp_pkts or total_mptcp_pkts or total_dss_events or total_timing_pkts or total_traffic_volume_pkts or total_throughput_pkts or total_reliability_pkts or total_delay_pkts) / max(worker_time, 1e-9)
+        pps = (total_frames or total_ip_pkts or total_tcp_pkts or total_mptcp_pkts or total_dss_events or total_timing_pkts or total_traffic_volume_pkts or total_throughput_pkts or total_reliability_pkts or total_delay_pkts or total_flow_activity_pkts) / max(worker_time, 1e-9)
         pps_str = f"{pps:,.0f} pkt/s"
         row_str += f"{pps_str:>14} {status:>8}"
         print(row_str)
