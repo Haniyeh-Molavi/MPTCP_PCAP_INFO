@@ -15,8 +15,8 @@ try:
     from protocol_layer.ethernet import stream_pcap_packets
     from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
 except ImportError:
-    from ethernet import stream_pcap_packets
-    from mptcp_level import compute_mptcp_token, parse_mptcp_packet
+    from protocol_layer.ethernet import stream_pcap_packets
+    from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
 
 
 def _tcp_options(packet_bytes: bytes) -> bytes | None:
