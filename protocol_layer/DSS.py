@@ -13,6 +13,7 @@ if str(_ROOT_DIR) not in sys.path:
 
 try:
     from protocol_layer.ethernet import stream_pcap_packets
+    from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
 except ImportError:
     try:
         from ethernet import stream_pcap_packets
@@ -24,6 +25,12 @@ except ImportError:
                 reader = dpkt.pcap.Reader(f)
                 for ts, pkt in reader:
                     yield float(ts), pkt
+
+        def parse_mptcp_packet(packet_bytes: bytes):
+            return None
+
+        def compute_mptcp_token(key_bytes: bytes) -> str:
+            return ""
 
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
@@ -176,15 +183,29 @@ def _format_number(value):
     return value
 
 
+def _subflow_key(parsed: dict) -> tuple[tuple[str, int], tuple[str, int]]:
+	return tuple(sorted((
+		(parsed["src_ip"], parsed["sport"]),
+		(parsed["dst_ip"], parsed["dport"]),
+	)))
+
+
+def _connection_token(parsed: dict) -> str | None:
+	if parsed.get("sender_key"):
+		return compute_mptcp_token(parsed["sender_key"])
+	if parsed.get("receiver_key"):
+		return compute_mptcp_token(parsed["receiver_key"])
+	if parsed.get("join_token"):
+		return f"0x{parsed['join_token'].hex().upper()}"
+	return None
+
+
 def extract_dss_to_csv(
     pcap_path: Path | str,
     output_csv_path: Path | str | None = None,
     limit_packets: int | None = None,
 ) -> dict:
-    """
-    Extract DSS features from a PCAP file and save the results as
-    '<pcap_stem>_dss.csv'. Each row represents a parsed DSS packet event.
-    """
+    """Extract aggregate DSS features and write one row per MPTCP connection."""
     pcap_path = Path(pcap_path).expanduser().resolve()
     if not pcap_path.exists():
         raise FileNotFoundError(f"PCAP file not found: {pcap_path}")
@@ -200,150 +221,138 @@ def extract_dss_to_csv(
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows = []
     packet_count = 0
     t_start = time.perf_counter()
-
-    connection_state: dict[tuple[tuple[str, int], tuple[str, int]], dict] = {}
-    subflow_state: dict[tuple[str, int, str, int], dict] = {}
-    dsn_seen_for_connection: dict[tuple[tuple[str, int], tuple[str, int]], dict[int, float]] = {}
+    connection_states: dict[str, dict] = {}
+    subflow_to_connection: dict[tuple[tuple[str, int], tuple[str, int]], str] = {}
+    token_to_connection: dict[str, str] = {}
+    next_connection_id = 1
 
     for ts, packet_bytes in stream_pcap_packets(pcap_path):
+        mptcp = parse_mptcp_packet(packet_bytes)
+        if mptcp is None:
+            continue
+
+        subflow_key = _subflow_key(mptcp)
+        connection_id = subflow_to_connection.get(subflow_key)
+        if connection_id is None:
+            token = _connection_token(mptcp)
+            if token:
+                connection_id = token_to_connection.get(token)
+                if connection_id is None:
+                    connection_id = f"conn_{next_connection_id}"
+                    next_connection_id += 1
+                    token_to_connection[token] = connection_id
+            else:
+                connection_id = f"conn_{next_connection_id}"
+                next_connection_id += 1
+            subflow_to_connection[subflow_key] = connection_id
+
         parsed = parse_dss_packet(packet_bytes)
         if parsed is None:
             continue
 
         packet_count += 1
-        if limit_packets is not None and packet_count > limit_packets:
+        if limit_packets is not None and packet_count >= limit_packets:
             break
 
-        endpoint_a = (parsed["src_ip"], parsed["sport"])
-        endpoint_b = (parsed["dst_ip"], parsed["dport"])
-        conn_key = tuple(sorted((endpoint_a, endpoint_b)))
-
-        subflow_key = (parsed["src_ip"], parsed["sport"], parsed["dst_ip"], parsed["dport"])
-
-        if conn_key not in connection_state:
-            connection_state[conn_key] = {
+        if connection_id not in connection_states:
+            connection_states[connection_id] = {
                 "start_ts": ts,
+                "last_ts": ts,
+                "minimum_dsn": None,
+                "maximum_dsn": None,
+                "final_dsn": None,
+                "data_ack_values": [],
+                "data_fin": False,
                 "total_bytes": 0,
-                "prev_dsn": None,
-                "prev_data_ack": None,
-                "prev_ts": ts,
-                "last_data_ack": None,
-            }
-            dsn_seen_for_connection[conn_key] = {}
-
-        if subflow_key not in subflow_state:
-            subflow_state[subflow_key] = {
-                "start_ts": ts,
-                "total_bytes": 0,
+                "previous_dsn": None,
+                "previous_ack": None,
+                "previous_ts": ts,
+                "dsn_rates": [],
+                "ack_rates": [],
+                "reordering_distances": [],
+                "reassembly_delays": [],
+                "dsn_times": {},
             }
 
-        conn_state = connection_state[conn_key]
-        subflow_state_entry = subflow_state[subflow_key]
+        conn_state = connection_states[connection_id]
+        conn_state["last_ts"] = ts
 
         data_length = parsed["data_length"] or 0
         conn_state["total_bytes"] += data_length
-        subflow_state_entry["total_bytes"] += data_length
+        dsn = parsed["data_sequence_number"]
+        ack = parsed["data_ack"]
+        if dsn is not None:
+            conn_state["minimum_dsn"] = dsn if conn_state["minimum_dsn"] is None else min(conn_state["minimum_dsn"], dsn)
+            conn_state["maximum_dsn"] = dsn if conn_state["maximum_dsn"] is None else max(conn_state["maximum_dsn"], dsn)
+            conn_state["final_dsn"] = dsn
+            if conn_state["previous_dsn"] is not None and conn_state["previous_ts"] != ts:
+                delta_dsn = dsn - conn_state["previous_dsn"]
+                if delta_dsn > 0:
+                    conn_state["dsn_rates"].append(delta_dsn / max(ts - conn_state["previous_ts"], 1e-9))
+            if conn_state["previous_dsn"] is not None:
+                conn_state["reordering_distances"].append(abs(dsn - conn_state["previous_dsn"]))
+            conn_state["dsn_times"][dsn] = ts
 
-        conn_elapsed = max(ts - conn_state["start_ts"], 1e-9)
-        subflow_elapsed = max(ts - subflow_state_entry["start_ts"], 1e-9)
+        if ack is not None:
+            conn_state["data_ack_values"].append(ack)
+            if conn_state["previous_ack"] is not None and conn_state["previous_ts"] != ts:
+                delta_ack = ack - conn_state["previous_ack"]
+                if delta_ack > 0:
+                    conn_state["ack_rates"].append(delta_ack / max(ts - conn_state["previous_ts"], 1e-9))
+            if ack in conn_state["dsn_times"]:
+                conn_state["reassembly_delays"].append(max(ts - conn_state["dsn_times"][ack], 0.0))
 
-        dsn_progression_rate = ""
-        if parsed["data_sequence_number"] is not None and conn_state["prev_dsn"] is not None and conn_state["prev_ts"] != ts:
-            delta_dsn = parsed["data_sequence_number"] - conn_state["prev_dsn"]
-            if delta_dsn > 0:
-                dsn_progression_rate = f"{delta_dsn / max(ts - conn_state['prev_ts'], 1e-9):.6f}"
-
-        data_ack_progression_rate = ""
-        if parsed["data_ack"] is not None and conn_state["prev_data_ack"] is not None and conn_state["prev_ts"] != ts:
-            delta_ack = parsed["data_ack"] - conn_state["prev_data_ack"]
-            if delta_ack > 0:
-                data_ack_progression_rate = f"{delta_ack / max(ts - conn_state['prev_ts'], 1e-9):.6f}"
-
-        connection_level_throughput = f"{conn_state['total_bytes'] / conn_elapsed:.6f}"
-        subflow_level_throughput = f"{subflow_state_entry['total_bytes'] / subflow_elapsed:.6f}"
-
-        reordering_distance = ""
-        if parsed["data_sequence_number"] is not None and conn_state["prev_dsn"] is not None:
-            reordering_distance = str(abs(parsed["data_sequence_number"] - conn_state["prev_dsn"]))
-
-        reassembly_delay = ""
-        if parsed["data_ack"] is not None:
-            dsn_lookup = dsn_seen_for_connection[conn_key]
-            if parsed["data_ack"] in dsn_lookup:
-                reassembly_delay = f"{max(ts - dsn_lookup[parsed['data_ack']], 0.0):.6f}"
-
-        row = {
-            "pcap_file": pcap_path.name,
-            "src_ip": parsed["src_ip"],
-            "dst_ip": parsed["dst_ip"],
-            "sport": parsed["sport"],
-            "dport": parsed["dport"],
-            "data_sequence_number": _format_number(parsed["data_sequence_number"]),
-            "data_ack": _format_number(parsed["data_ack"]),
-            "subflow_sequence_number": _format_number(parsed["subflow_sequence_number"]),
-            "data_length": _format_number(parsed["data_length"]),
-            "mapping_length": _format_number(parsed["mapping_length"]),
-            "data_fin": parsed["data_fin"],
-            "dsn_progression_rate": dsn_progression_rate,
-            "data_ack_progression_rate": data_ack_progression_rate,
-            "connection_level_throughput": connection_level_throughput,
-            "subflow_level_throughput": subflow_level_throughput,
-            "reordering_distance": reordering_distance,
-            "reassembly_delay": reassembly_delay,
-        }
-        rows.append(row)
-
-        if parsed["data_sequence_number"] is not None:
-            dsn_seen_for_connection[conn_key][parsed["data_sequence_number"]] = ts
-
-        conn_state["prev_dsn"] = parsed["data_sequence_number"]
-        conn_state["prev_data_ack"] = parsed["data_ack"]
-        conn_state["prev_ts"] = ts
+        conn_state["data_fin"] = conn_state["data_fin"] or bool(parsed["data_fin"])
+        conn_state["previous_dsn"] = dsn
+        conn_state["previous_ack"] = ack
+        conn_state["previous_ts"] = ts
 
     with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
             "PCAP File",
-            "Source IP",
-            "Destination IP",
-            "Source Port",
-            "Destination Port",
-            "Data Sequence Number",
-            "Data ACK",
-            "Subflow Sequence Number",
-            "Data Length",
-            "Mapping Length",
+            "MPTCP Connection ID",
+            "Minimum DSN",
+            "Maximum DSN",
+            "Final DSN",
+            "Data ACK Values",
             "DATA_FIN",
-            "DSN Progression Rate",
-            "Data ACK Progression Rate",
+            "Total Data Length",
+            "DSN Range",
             "Connection-Level Throughput",
-            "Subflow-Level Throughput",
-            "Reordering Distance",
-            "Reassembly Delay",
+            "Average DSN Progression Rate",
+            "Average Data ACK Progression Rate",
+            "Maximum Reordering Distance",
+            "Average Reassembly Delay",
         ])
 
-        for row in rows:
+        for connection_id in sorted(connection_states):
+            state = connection_states[connection_id]
+            duration = max(state["last_ts"] - state["start_ts"], 1e-9)
+            dsn_range = ""
+            if state["minimum_dsn"] is not None and state["maximum_dsn"] is not None:
+                dsn_range = state["maximum_dsn"] - state["minimum_dsn"]
+            average_dsn_rate = sum(state["dsn_rates"]) / len(state["dsn_rates"]) if state["dsn_rates"] else ""
+            average_ack_rate = sum(state["ack_rates"]) / len(state["ack_rates"]) if state["ack_rates"] else ""
+            max_reordering = max(state["reordering_distances"]) if state["reordering_distances"] else ""
+            average_reassembly = sum(state["reassembly_delays"]) / len(state["reassembly_delays"]) if state["reassembly_delays"] else ""
             writer.writerow([
-                row["pcap_file"],
-                row["src_ip"],
-                row["dst_ip"],
-                row["sport"],
-                row["dport"],
-                row["data_sequence_number"],
-                row["data_ack"],
-                row["subflow_sequence_number"],
-                row["data_length"],
-                row["mapping_length"],
-                row["data_fin"],
-                row["dsn_progression_rate"],
-                row["data_ack_progression_rate"],
-                row["connection_level_throughput"],
-                row["subflow_level_throughput"],
-                row["reordering_distance"],
-                row["reassembly_delay"],
+                pcap_path.name,
+                connection_id,
+                _format_number(state["minimum_dsn"]),
+                _format_number(state["maximum_dsn"]),
+                _format_number(state["final_dsn"]),
+                ";".join(str(value) for value in state["data_ack_values"]),
+                "1" if state["data_fin"] else "0",
+                state["total_bytes"],
+                dsn_range,
+                f"{state['total_bytes'] / duration:.6f}",
+                f"{average_dsn_rate:.6f}" if average_dsn_rate != "" else "",
+                f"{average_ack_rate:.6f}" if average_ack_rate != "" else "",
+                max_reordering,
+                f"{average_reassembly:.6f}" if average_reassembly != "" else "",
             ])
 
     elapsed = max(time.perf_counter() - t_start, 1e-9)
@@ -352,7 +361,8 @@ def extract_dss_to_csv(
         "pcap_file": str(pcap_path),
         "csv_file": str(csv_path),
         "packet_count": packet_count,
-        "dss_events": len(rows),
+        "connection_count": len(connection_states),
+        "dss_events": packet_count,
         "csv_size_bytes": csv_path.stat().st_size,
         "processing_time_seconds": elapsed,
     }

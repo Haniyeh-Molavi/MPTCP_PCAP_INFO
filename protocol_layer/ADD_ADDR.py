@@ -13,9 +13,11 @@ if str(_ROOT_DIR) not in sys.path:
 
 try:
     from protocol_layer.ethernet import stream_pcap_packets
+    from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
 except ImportError:
     try:
         from ethernet import stream_pcap_packets
+        from mptcp_level import compute_mptcp_token, parse_mptcp_packet
     except ImportError:
         import dpkt
 
@@ -24,6 +26,12 @@ except ImportError:
                 reader = dpkt.pcap.Reader(f)
                 for ts, pkt in reader:
                     yield float(ts), pkt
+
+        def parse_mptcp_packet(packet_bytes: bytes):
+            return None
+
+        def compute_mptcp_token(key_bytes: bytes) -> str:
+            return ""
 
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
@@ -150,15 +158,46 @@ def parse_add_addr_packet(packet_bytes: bytes):
     return None
 
 
+def _subflow_key(parsed: dict) -> tuple[tuple[str, int], tuple[str, int]]:
+    return tuple(sorted((
+        (parsed["src_ip"], parsed["sport"]),
+        (parsed["dst_ip"], parsed["dport"]),
+    )))
+
+
+def _join_token(packet_bytes: bytes) -> str | None:
+    parsed = _extract_mptcp_options(packet_bytes)
+    if parsed is None:
+        return None
+
+    options = parsed["options"]
+    index = 0
+    while index < len(options):
+        kind = options[index]
+        if kind == 0:
+            break
+        if kind == 1:
+            index += 1
+            continue
+        if index + 1 >= len(options):
+            break
+        length = options[index + 1]
+        if length < 2 or index + length > len(options):
+            break
+        if kind == 30:
+            value = options[index + 2 : index + length]
+            if value and value[0] >> 4 == 1 and len(value) >= 5:
+                return f"0x{value[1:5].hex().upper()}"
+        index += length
+    return None
+
+
 def extract_add_addr_to_csv(
     pcap_path: Path | str,
     output_csv_path: Path | str | None = None,
     limit_packets: int | None = None,
 ) -> dict:
-    """
-    Extract ADD_ADDR features from a PCAP file and save the results as
-    '<pcap_stem>_add_addr.csv'. Each row represents one ADD_ADDR advertisement.
-    """
+    """Extract ADD_ADDR features and write one aggregate row per MPTCP connection."""
     pcap_path = Path(pcap_path).expanduser().resolve()
     if not pcap_path.exists():
         raise FileNotFoundError(f"PCAP file not found: {pcap_path}")
@@ -174,86 +213,96 @@ def extract_add_addr_to_csv(
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows = []
+    connection_events: dict[str, list[dict]] = {}
+    subflow_to_connection: dict[tuple[tuple[str, int], tuple[str, int]], str] = {}
+    token_to_connection: dict[str, str] = {}
+    next_connection_id = 1
     packet_count = 0
     t_start = time.perf_counter()
-    first_ts = None
-    last_ts = None
-    advertised_paths = set()
 
     for ts, packet_bytes in stream_pcap_packets(pcap_path):
+        mptcp = parse_mptcp_packet(packet_bytes)
+        if mptcp is None:
+            continue
+
+        subflow_key = _subflow_key(mptcp)
+        connection_id = subflow_to_connection.get(subflow_key)
+        if connection_id is None:
+            connection_token = None
+            if mptcp.get("sender_key"):
+                connection_token = compute_mptcp_token(mptcp["sender_key"])
+            elif mptcp.get("receiver_key"):
+                connection_token = compute_mptcp_token(mptcp["receiver_key"])
+            else:
+                connection_token = _join_token(packet_bytes)
+
+            if connection_token:
+                connection_id = token_to_connection.get(connection_token)
+                if connection_id is None:
+                    connection_id = f"conn_{next_connection_id}"
+                    next_connection_id += 1
+                    token_to_connection[connection_token] = connection_id
+            else:
+                connection_id = f"conn_{next_connection_id}"
+                next_connection_id += 1
+            subflow_to_connection[subflow_key] = connection_id
+
         parsed = parse_add_addr_packet(packet_bytes)
         if parsed is None:
             continue
 
         packet_count += 1
-        if first_ts is None:
-            first_ts = ts
-        last_ts = ts
-
-        advertised_paths.add((parsed["advertised_ip_address"], parsed["port_number"]))
-
-        rows.append(
-            {
-                "pcap_file": pcap_path.name,
-                "src_ip": parsed["src_ip"],
-                "dst_ip": parsed["dst_ip"],
-                "sport": parsed["sport"],
-                "dport": parsed["dport"],
-                "address_id": parsed["address_id"],
-                "advertised_ip_address": parsed["advertised_ip_address"],
-                "port_number": parsed["port_number"],
-            }
-        )
+        connection_events.setdefault(connection_id, []).append({
+            "timestamp": ts,
+            "advertised_path": (
+                parsed["advertised_ip_address"],
+                parsed["port_number"],
+            ),
+        })
 
         if limit_packets is not None and packet_count >= limit_packets:
             break
-
-    duration = max((last_ts or first_ts or 0.0) - (first_ts or 0.0), 0.0)
-    total_events = len(rows)
-    advertised_path_count = len(advertised_paths)
-    frequency = total_events / duration if duration > 0 else float(total_events)
 
     with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
             "PCAP File",
-            "Source IP",
-            "Destination IP",
-            "Source Port",
-            "Destination Port",
-            "Address ID",
-            "Advertised IP Address",
-            "Port Number",
+            "MPTCP Connection ID",
             "ADD_ADDR Count",
             "Number of Advertised Paths",
             "Address Advertisement Frequency",
         ])
 
-        for row in rows:
+        for connection_id in sorted(connection_events):
+            events = connection_events[connection_id]
+            duration = max(events[-1]["timestamp"] - events[0]["timestamp"], 0.0)
+            total_events = len(events)
+            advertised_path_count = len({
+                event["advertised_path"] for event in events
+            })
+            frequency = total_events / duration if duration > 0 else float(total_events)
             writer.writerow([
-                row["pcap_file"],
-                row["src_ip"],
-                row["dst_ip"],
-                row["sport"],
-                row["dport"],
-                row["address_id"],
-                row["advertised_ip_address"],
-                row["port_number"],
+                pcap_path.name,
+                connection_id,
                 total_events,
                 advertised_path_count,
                 f"{frequency:.6f}",
             ])
 
+    total_events = sum(len(events) for events in connection_events.values())
+    advertised_path_count = sum(
+        len({event["advertised_path"] for event in events})
+        for events in connection_events.values()
+    )
     elapsed = max(time.perf_counter() - t_start, 1e-9)
 
     return {
         "pcap_file": str(pcap_path),
         "csv_file": str(csv_path),
         "packet_count": packet_count,
+        "connection_count": len(connection_events),
         "add_addr_events": total_events,
         "advertised_paths": advertised_path_count,
-        "address_advertisement_frequency": frequency,
         "csv_size_bytes": csv_path.stat().st_size,
         "processing_time_seconds": elapsed,
     }

@@ -158,10 +158,7 @@ def extract_mp_capable_to_csv(
     output_csv_path: Path | str | None = None,
     limit_packets: int | None = None,
 ) -> dict:
-    """
-    Extract MP_CAPABLE handshake metadata from a PCAP file and save the result as
-    '<pcap_stem>_mp_capable.csv'. Each CSV row represents one connection handshake.
-    """
+    """Extract MP_CAPABLE handshake features with one row per MPTCP connection."""
     pcap_path = Path(pcap_path).expanduser().resolve()
     if not pcap_path.exists():
         raise FileNotFoundError(f"PCAP file not found: {pcap_path}")
@@ -207,6 +204,7 @@ def extract_mp_capable_to_csv(
                 "checksum_capability": None,
                 "mptcp_version": None,
                 "connection_token": "",
+                "connection_id": f"conn_{len(sessions) + 1}",
                 "start_ts": ts,
                 "response_ts": None,
                 "status": "Failure",
@@ -244,6 +242,7 @@ def extract_mp_capable_to_csv(
         writer = csv.writer(csvfile)
         writer.writerow([
             "PCAP File",
+            "MPTCP Connection ID",
             "Source IP",
             "Destination IP",
             "Source Port",
@@ -267,6 +266,7 @@ def extract_mp_capable_to_csv(
 
             writer.writerow([
                 pcap_path.name,
+                state["connection_id"],
                 state["src_ip"],
                 state["dst_ip"],
                 state["sport"],
@@ -288,6 +288,7 @@ def extract_mp_capable_to_csv(
         "csv_file": str(csv_path),
         "packet_count": packet_count,
         "session_count": len(ordered_sessions),
+        "connection_count": len(ordered_sessions),
         "csv_size_bytes": csv_path.stat().st_size,
         "processing_time_seconds": elapsed,
     }

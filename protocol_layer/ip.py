@@ -18,6 +18,7 @@ if str(_ROOT_DIR) not in sys.path:
 # Import streaming reader from ethernet module or fallback
 try:
     from protocol_layer.ethernet import stream_pcap_packets
+    from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
 except ImportError:
     try:
         from ethernet import stream_pcap_packets
@@ -28,6 +29,8 @@ except ImportError:
                 reader = dpkt.pcap.Reader(f)
                 for ts, pkt in reader:
                     yield float(ts), pkt
+
+        from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
 DEFAULT_CSV_BATCH_SIZE = 5000
@@ -282,11 +285,7 @@ def extract_ip_to_csv(
     limit_packets: int | None = None,
     batch_size: int = DEFAULT_CSV_BATCH_SIZE,
 ) -> dict:
-    """
-    Extract and calculate all 17 IP features from a PCAP file and save directly to a CSV file.
-    By default, saves to '[pcap_stem]_ip.csv' alongside the PCAP.
-    Streaming batch writes ensure O(1) memory usage regardless of file size.
-    """
+    """Extract aggregate IP features with one row per MPTCP connection."""
     pcap_path = Path(pcap_path).resolve()
     if not pcap_path.exists():
         raise FileNotFoundError(f"PCAP file not found: {pcap_path}")
@@ -302,75 +301,136 @@ def extract_ip_to_csv(
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    evaluator = IPFeatureEvaluator()
-    batch = []
     t_start = time.perf_counter()
     skipped_non_ip = 0
+    connections: dict[str, dict] = {}
+    subflow_to_connection: dict[tuple[tuple[str, int], tuple[str, int]], str] = {}
+    token_to_connection: dict[str, str] = {}
+    next_connection_id = 1
+    packet_count = 0
+
+    for ts, pkt_bytes in stream_pcap_packets(pcap_path):
+        parsed_ip = parse_ip_packet(pkt_bytes)
+        mptcp = parse_mptcp_packet(pkt_bytes)
+        if parsed_ip is None or mptcp is None:
+            skipped_non_ip += 1
+            continue
+
+        subflow_key = tuple(sorted((
+            (mptcp["src_ip"], mptcp["sport"]),
+            (mptcp["dst_ip"], mptcp["dport"]),
+        )))
+        connection_id = subflow_to_connection.get(subflow_key)
+        if connection_id is None:
+            token = None
+            if mptcp.get("sender_key"):
+                token = compute_mptcp_token(mptcp["sender_key"])
+            elif mptcp.get("receiver_key"):
+                token = compute_mptcp_token(mptcp["receiver_key"])
+            elif mptcp.get("join_token"):
+                token = f"0x{mptcp['join_token'].hex().upper()}"
+            if token:
+                connection_id = token_to_connection.get(token)
+                if connection_id is None:
+                    connection_id = f"conn_{next_connection_id}"
+                    next_connection_id += 1
+                    token_to_connection[token] = connection_id
+            else:
+                connection_id = f"conn_{next_connection_id}"
+                next_connection_id += 1
+            subflow_to_connection[subflow_key] = connection_id
+
+        state = connections.setdefault(connection_id, {
+            "packet_count": 0,
+            "total_bytes": 0,
+            "first_timestamp": ts,
+            "last_timestamp": ts,
+            "versions": set(),
+            "source_ips": set(),
+            "destination_ips": set(),
+            "ttls": [],
+            "dscp": set(),
+            "protocols": set(),
+            "identifications": set(),
+            "fragment_offsets": set(),
+            "fragment_flags": set(),
+            "header_lengths": set(),
+            "paths": set(),
+        })
+        state["packet_count"] += 1
+        packet_count += 1
+        state["total_bytes"] += parsed_ip["total_len"]
+        state["last_timestamp"] = ts
+        state["versions"].add(str(parsed_ip["version"]))
+        state["source_ips"].add(parsed_ip["src_ip"])
+        state["destination_ips"].add(parsed_ip["dst_ip"])
+        state["ttls"].append(parsed_ip["ttl"])
+        state["dscp"].add(str(parsed_ip["dscp_tos"]))
+        state["protocols"].add(str(parsed_ip["protocol"]))
+        state["identifications"].add(str(parsed_ip["ident"]))
+        state["fragment_offsets"].add(str(parsed_ip["frag_offset"]))
+        state["fragment_flags"].add(parsed_ip["frag_flags"])
+        state["header_lengths"].add(str(parsed_ip["header_len"]))
+        state["paths"].add((parsed_ip["src_ip"], parsed_ip["dst_ip"]))
+
+        if limit_packets is not None and packet_count >= limit_packets:
+            break
 
     with open(csv_path, "w", newline="", buffering=2 * 1024 * 1024, encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
-            "Packet Number",
-            "Timestamp",
-            "Source IP",
-            "Destination IP",
-            "TTL / Hop Limit",
-            "DSCP/TOS",
-            "Protocol Number",
-            "Identification",
-            "Fragment Offset",
-            "Fragment Flags",
-            "Header Length",
-            "Total Length",
-            "Packet Rate",
-            "Byte Rate",
-            "Flow Duration",
-            "Unique IP Count",
-            "Path Count",
-            "TTL Mean",
-            "TTL Variance",
+            "PCAP File", "MPTCP Connection ID", "Packet Count", "IP Versions",
+            "Source IPs", "Destination IPs", "TTL Mean", "TTL Variance",
+            "DSCP/TOS Values", "Protocol Numbers", "Identification Values",
+            "Fragment Offsets", "Fragment Flags", "Header Lengths",
+            "Total IP Bytes", "Packet Rate", "Byte Rate", "Flow Duration",
+            "Unique IP Count", "Path Count",
         ])
-
-        for ts, pkt_bytes in stream_pcap_packets(pcap_path):
-            parsed_ip = parse_ip_packet(pkt_bytes)
-            if parsed_ip is None:
-                skipped_non_ip += 1
-                continue
-
-            row = evaluator.evaluate_packet(ts, parsed_ip)
-            batch.append(row)
-
-            if len(batch) >= batch_size:
-                writer.writerows(batch)
-                batch.clear()
-
-            if limit_packets is not None and evaluator.packet_count >= limit_packets:
-                break
-
-        if batch:
-            writer.writerows(batch)
-            batch.clear()
+        for connection_id in sorted(connections):
+            state = connections[connection_id]
+            duration = max(state["last_timestamp"] - state["first_timestamp"], 0.0)
+            ttl_mean = sum(state["ttls"]) / len(state["ttls"])
+            ttl_variance = (
+                sum((value - ttl_mean) ** 2 for value in state["ttls"]) /
+                (len(state["ttls"]) - 1)
+                if len(state["ttls"]) > 1 else 0.0
+            )
+            packet_rate = state["packet_count"] / duration if duration > 0 else 0.0
+            byte_rate = state["total_bytes"] / duration if duration > 0 else 0.0
+            unique_ips = state["source_ips"] | state["destination_ips"]
+            writer.writerow([
+                pcap_path.name, connection_id, state["packet_count"],
+                ";".join(sorted(state["versions"])),
+                ";".join(sorted(state["source_ips"])),
+                ";".join(sorted(state["destination_ips"])),
+                f"{ttl_mean:.2f}", f"{ttl_variance:.2f}",
+                ";".join(sorted(state["dscp"])),
+                ";".join(sorted(state["protocols"])),
+                ";".join(sorted(state["identifications"])),
+                ";".join(sorted(state["fragment_offsets"])),
+                ";".join(sorted(state["fragment_flags"])),
+                ";".join(sorted(state["header_lengths"])),
+                state["total_bytes"], f"{packet_rate:.6f}", f"{byte_rate:.6f}",
+                f"{duration:.6f}", len(unique_ips), len(state["paths"]),
+            ])
 
     t_elapsed = max(time.perf_counter() - t_start, 1e-9)
     csv_size = csv_path.stat().st_size if csv_path.exists() else 0
 
-    final_variance = (evaluator.ttl_M2 / (evaluator.packet_count - 1)) if evaluator.packet_count > 1 else 0.0
+    total_ip_bytes = sum(state["total_bytes"] for state in connections.values())
 
     return {
         "pcap_file": str(pcap_path),
         "csv_file": str(csv_path),
-        "packet_count": evaluator.packet_count,
+        "packet_count": packet_count,
+        "connection_count": len(connections),
         "skipped_non_ip": skipped_non_ip,
-        "total_ip_bytes": evaluator.total_ip_bytes,
+        "total_ip_bytes": total_ip_bytes,
         "csv_size_bytes": csv_size,
-        "unique_ip_count": len(evaluator.unique_ips),
-        "path_count": len(evaluator.unique_paths),
-        "ttl_mean": evaluator.ttl_mean,
-        "ttl_variance": final_variance,
-        "first_timestamp": evaluator.first_timestamp,
-        "last_timestamp": evaluator.last_timestamp,
+        "unique_ip_count": len(set().union(*(state["source_ips"] | state["destination_ips"] for state in connections.values())) if connections else 0),
+        "path_count": len(set().union(*(state["paths"] for state in connections.values())) if connections else set()),
         "processing_time_seconds": t_elapsed,
-        "throughput_packets_per_sec": evaluator.packet_count / t_elapsed,
+        "throughput_packets_per_sec": packet_count / t_elapsed,
     }
 
 
@@ -426,4 +486,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

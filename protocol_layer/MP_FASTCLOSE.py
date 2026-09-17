@@ -13,11 +13,19 @@ if str(_ROOT_DIR) not in sys.path:
 
 try:
     from protocol_layer.ethernet import stream_pcap_packets
+    from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
 except ImportError:
     try:
         from ethernet import stream_pcap_packets
+        from mptcp_level import compute_mptcp_token, parse_mptcp_packet
     except ImportError:
         import dpkt
+
+        def compute_mptcp_token(key_bytes: bytes) -> str:
+            return ""
+
+        def parse_mptcp_packet(packet_bytes: bytes) -> dict | None:
+            return None
 
         def stream_pcap_packets(file_path: Path | str):
             with open(file_path, "rb") as f:
@@ -145,14 +153,32 @@ def parse_mp_fastclose_packet(packet_bytes: bytes):
     return None
 
 
+def _subflow_key(parsed: dict) -> tuple[tuple[str, int], tuple[str, int]]:
+    return tuple(sorted((
+        (parsed["src_ip"], parsed["sport"]),
+        (parsed["dst_ip"], parsed["dport"]),
+    )))
+
+
+def _connection_token(parsed: dict) -> str:
+    key = parsed.get("sender_key") or parsed.get("receiver_key")
+    if key:
+        return compute_mptcp_token(key)
+    join_token = parsed.get("join_token")
+    if join_token:
+        return f"0x{join_token.hex().upper()}"
+    return ""
+
+
 def extract_mp_fastclose_to_csv(
     pcap_path: Path | str,
     output_csv_path: Path | str | None = None,
     limit_packets: int | None = None,
 ) -> dict:
     """
-    Extract MP_FASTCLOSE features from a PCAP file and save the results as
-    '<pcap_stem>_mp_fastclose.csv'.
+    Extract MP_FASTCLOSE features and write one aggregate row per MPTCP
+    connection. Connections are correlated using MP_CAPABLE keys, MP_JOIN
+    tokens, and canonical TCP subflow endpoints.
     """
     pcap_path = Path(pcap_path).expanduser().resolve()
     if not pcap_path.exists():
@@ -169,69 +195,95 @@ def extract_mp_fastclose_to_csv(
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows = []
+    connection_events: dict[str, list[dict]] = {}
+    subflow_to_connection: dict[tuple[tuple[str, int], tuple[str, int]], str] = {}
+    token_to_connection: dict[str, str] = {}
+    next_connection_id = 1
     packet_count = 0
     t_start = time.perf_counter()
-    first_ts = None
-    last_ts = None
-    fast_close_count = 0
 
     for ts, packet_bytes in stream_pcap_packets(pcap_path):
+        mptcp = parse_mptcp_packet(packet_bytes)
+        if mptcp is None:
+            continue
+
         parsed = parse_mp_fastclose_packet(packet_bytes)
+        subflow_key = _subflow_key(mptcp)
+        connection_id = subflow_to_connection.get(subflow_key)
+        connection_token = _connection_token(mptcp)
+        if parsed is not None and parsed.get("receiver_key"):
+            connection_token = compute_mptcp_token(parsed["receiver_key"])
+        if connection_id is None and connection_token:
+            connection_id = token_to_connection.get(connection_token)
+        if connection_id is None:
+            connection_id = f"conn_{next_connection_id}"
+            next_connection_id += 1
+        subflow_to_connection[subflow_key] = connection_id
+        if connection_token:
+            token_to_connection[connection_token] = connection_id
+
         if parsed is None:
             continue
 
         packet_count += 1
-        fast_close_count += 1
-        if first_ts is None:
-            first_ts = ts
-        last_ts = ts
-
-        rows.append(
-            {
-                "pcap_file": pcap_path.name,
-                "src_ip": parsed["src_ip"],
-                "dst_ip": parsed["dst_ip"],
-                "sport": parsed["sport"],
-                "dport": parsed["dport"],
-                "receiver_key": _format_key(parsed.get("receiver_key")),
-                "fast_close_count": fast_close_count,
-                "fast_close_time": f"{ts:.6f}",
-                "forced_connection_termination": 1,
-            }
-        )
+        connection_events.setdefault(connection_id, []).append({
+            "timestamp": ts,
+            "src_ip": parsed["src_ip"],
+            "dst_ip": parsed["dst_ip"],
+            "sport": parsed["sport"],
+            "dport": parsed["dport"],
+            "receiver_key": _format_key(parsed.get("receiver_key")),
+        })
 
         if limit_packets is not None and packet_count >= limit_packets:
             break
 
-    total_events = len(rows)
     with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
             "PCAP File",
+            "MPTCP Connection ID",
             "Source IP",
             "Destination IP",
             "Source Port",
             "Destination Port",
             "Receiver Key",
             "Fast Close Count",
-            "Fast Close Time",
+            "First Fast Close Time",
+            "Last Fast Close Time",
             "Forced Connection Termination",
         ])
 
-        for row in rows:
+        for connection_id in sorted(connection_events):
+            events = connection_events[connection_id]
+            first_event = events[0]
             writer.writerow([
-                row["pcap_file"],
-                row["src_ip"],
-                row["dst_ip"],
-                row["sport"],
-                row["dport"],
-                row["receiver_key"],
-                row["fast_close_count"],
-                row["fast_close_time"],
-                row["forced_connection_termination"],
+                pcap_path.name,
+                connection_id,
+                first_event["src_ip"],
+                first_event["dst_ip"],
+                first_event["sport"],
+                first_event["dport"],
+                ";".join(sorted({
+                    event["receiver_key"]
+                    for event in events
+                    if event["receiver_key"]
+                })),
+                len(events),
+                f"{events[0]['timestamp']:.6f}",
+                f"{events[-1]['timestamp']:.6f}",
+                1,
             ])
 
+    total_events = sum(len(events) for events in connection_events.values())
+    first_ts = min(
+        (events[0]["timestamp"] for events in connection_events.values()),
+        default=None,
+    )
+    last_ts = max(
+        (events[-1]["timestamp"] for events in connection_events.values()),
+        default=None,
+    )
     elapsed = max(time.perf_counter() - t_start, 1e-9)
 
     return {
@@ -239,6 +291,7 @@ def extract_mp_fastclose_to_csv(
         "csv_file": str(csv_path),
         "packet_count": packet_count,
         "mp_fastclose_events": total_events,
+        "connection_count": len(connection_events),
         "first_fast_close_time": first_ts,
         "last_fast_close_time": last_ts,
         "csv_size_bytes": csv_path.stat().st_size,

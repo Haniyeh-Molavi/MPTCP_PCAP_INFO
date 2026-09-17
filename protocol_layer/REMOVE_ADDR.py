@@ -13,11 +13,19 @@ if str(_ROOT_DIR) not in sys.path:
 
 try:
     from protocol_layer.ethernet import stream_pcap_packets
+    from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
 except ImportError:
     try:
         from ethernet import stream_pcap_packets
+        from mptcp_level import compute_mptcp_token, parse_mptcp_packet
     except ImportError:
         import dpkt
+
+        def compute_mptcp_token(key_bytes: bytes) -> str:
+            return ""
+
+        def parse_mptcp_packet(packet_bytes: bytes) -> dict | None:
+            return None
 
         def stream_pcap_packets(file_path: Path | str):
             with open(file_path, "rb") as f:
@@ -136,14 +144,32 @@ def parse_remove_addr_packet(packet_bytes: bytes):
     return None
 
 
+def _subflow_key(parsed: dict) -> tuple[tuple[str, int], tuple[str, int]]:
+    return tuple(sorted((
+        (parsed["src_ip"], parsed["sport"]),
+        (parsed["dst_ip"], parsed["dport"]),
+    )))
+
+
+def _connection_token(parsed: dict) -> str:
+    key = parsed.get("sender_key") or parsed.get("receiver_key")
+    if key:
+        return compute_mptcp_token(key)
+    join_token = parsed.get("join_token")
+    if join_token:
+        return f"0x{join_token.hex().upper()}"
+    return ""
+
+
 def extract_remove_addr_to_csv(
     pcap_path: Path | str,
     output_csv_path: Path | str | None = None,
     limit_packets: int | None = None,
 ) -> dict:
     """
-    Extract REMOVE_ADDR features from a PCAP file and save the results as
-    '<pcap_stem>_remove_addr.csv'. Each row represents one removed address path.
+    Extract REMOVE_ADDR features and write one aggregate row per MPTCP
+    connection. Connections are correlated using MP_CAPABLE keys, MP_JOIN
+    tokens, and canonical TCP subflow endpoints.
     """
     pcap_path = Path(pcap_path).expanduser().resolve()
     if not pcap_path.exists():
@@ -160,41 +186,43 @@ def extract_remove_addr_to_csv(
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows = []
+    connection_events: dict[str, list[dict]] = {}
+    subflow_to_connection: dict[tuple[tuple[str, int], tuple[str, int]], str] = {}
+    token_to_connection: dict[str, str] = {}
+    next_connection_id = 1
     packet_count = 0
-    first_ts = None
-    last_ts = None
     t_start = time.perf_counter()
 
     for ts, packet_bytes in stream_pcap_packets(pcap_path):
+        mptcp = parse_mptcp_packet(packet_bytes)
+        if mptcp is None:
+            continue
+
+        subflow_key = _subflow_key(mptcp)
+        connection_id = subflow_to_connection.get(subflow_key)
+        connection_token = _connection_token(mptcp)
+        if connection_id is None and connection_token:
+            connection_id = token_to_connection.get(connection_token)
+        if connection_id is None:
+            connection_id = f"conn_{next_connection_id}"
+            next_connection_id += 1
+        subflow_to_connection[subflow_key] = connection_id
+        if connection_token:
+            token_to_connection[connection_token] = connection_id
+
         parsed = parse_remove_addr_packet(packet_bytes)
         if parsed is None:
             continue
 
         packet_count += 1
-        if first_ts is None:
-            first_ts = ts
-        last_ts = ts
-
-        address_ids = parsed["address_ids"]
-        removed_address_count = len(address_ids)
-        duration = max((last_ts or first_ts or 0.0) - (first_ts or 0.0), 0.0)
-        removed_path_frequency = removed_address_count / duration if duration > 0 else float(removed_address_count)
-
-        for address_id in address_ids:
-            rows.append(
-                {
-                    "pcap_file": pcap_path.name,
-                    "src_ip": parsed["src_ip"],
-                    "dst_ip": parsed["dst_ip"],
-                    "sport": parsed["sport"],
-                    "dport": parsed["dport"],
-                    "address_id": address_id,
-                    "removed_address_count": removed_address_count,
-                    "removed_path_frequency": f"{removed_path_frequency:.6f}",
-                    "path_lifetime": f"{duration:.6f}",
-                }
-            )
+        connection_events.setdefault(connection_id, []).append({
+            "timestamp": ts,
+            "src_ip": parsed["src_ip"],
+            "dst_ip": parsed["dst_ip"],
+            "sport": parsed["sport"],
+            "dport": parsed["dport"],
+            "address_ids": parsed["address_ids"],
+        })
 
         if limit_packets is not None and packet_count >= limit_packets:
             break
@@ -203,36 +231,62 @@ def extract_remove_addr_to_csv(
         writer = csv.writer(csvfile)
         writer.writerow([
             "PCAP File",
+            "MPTCP Connection ID",
             "Source IP",
             "Destination IP",
             "Source Port",
             "Destination Port",
-            "Address ID",
+            "Removed Address IDs",
+            "REMOVE_ADDR Event Count",
             "Removed Address Count",
             "Removed Path Frequency",
             "Path Lifetime",
         ])
 
-        for row in rows:
+        for connection_id in sorted(connection_events):
+            events = connection_events[connection_id]
+            first_event = events[0]
+            address_ids = sorted({
+                address_id
+                for event in events
+                for address_id in event["address_ids"]
+            })
+            removed_address_count = sum(
+                len(event["address_ids"]) for event in events
+            )
+            duration = max(events[-1]["timestamp"] - events[0]["timestamp"], 0.0)
+            frequency = (
+                removed_address_count / duration
+                if duration > 0
+                else float(removed_address_count)
+            )
             writer.writerow([
-                row["pcap_file"],
-                row["src_ip"],
-                row["dst_ip"],
-                row["sport"],
-                row["dport"],
-                row["address_id"],
-                row["removed_address_count"],
-                row["removed_path_frequency"],
-                row["path_lifetime"],
+                pcap_path.name,
+                connection_id,
+                first_event["src_ip"],
+                first_event["dst_ip"],
+                first_event["sport"],
+                first_event["dport"],
+                ";".join(str(address_id) for address_id in address_ids),
+                len(events),
+                removed_address_count,
+                f"{frequency:.6f}",
+                f"{duration:.6f}",
             ])
 
+    total_events = sum(
+        len(event["address_ids"])
+        for events in connection_events.values()
+        for event in events
+    )
     elapsed = max(time.perf_counter() - t_start, 1e-9)
 
     return {
         "pcap_file": str(pcap_path),
         "csv_file": str(csv_path),
         "packet_count": packet_count,
-        "remove_addr_events": len(rows),
+        "remove_addr_events": total_events,
+        "connection_count": len(connection_events),
         "csv_size_bytes": csv_path.stat().st_size,
         "processing_time_seconds": elapsed,
     }

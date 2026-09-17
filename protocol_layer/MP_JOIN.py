@@ -13,11 +13,19 @@ if str(_ROOT_DIR) not in sys.path:
 
 try:
     from protocol_layer.ethernet import stream_pcap_packets
+    from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
 except ImportError:
     try:
         from ethernet import stream_pcap_packets
+        from mptcp_level import compute_mptcp_token, parse_mptcp_packet
     except ImportError:
         import dpkt
+
+        def compute_mptcp_token(key_bytes: bytes) -> str:
+            return ""
+
+        def parse_mptcp_packet(packet_bytes: bytes) -> dict | None:
+            return None
 
         def stream_pcap_packets(file_path: Path | str):
             with open(file_path, "rb") as f:
@@ -146,14 +154,33 @@ def _format_hex(data: bytes | None) -> str:
     return f"0x{data.hex().upper()}"
 
 
+def _subflow_key(parsed: dict) -> tuple[tuple[str, int], tuple[str, int]]:
+    return tuple(sorted((
+        (parsed["src_ip"], parsed["sport"]),
+        (parsed["dst_ip"], parsed["dport"]),
+    )))
+
+
+def _connection_token(parsed: dict) -> str:
+    key = parsed.get("sender_key") or parsed.get("receiver_key")
+    if key:
+        return compute_mptcp_token(key)
+    join_token = parsed.get("join_token")
+    if join_token:
+        return f"0x{join_token.hex().upper()}"
+    return ""
+
+
 def extract_mp_join_to_csv(
     pcap_path: Path | str,
     output_csv_path: Path | str | None = None,
     limit_packets: int | None = None,
 ) -> dict:
     """
-    Extract MP_JOIN features from a PCAP file and save the result as
-    '<pcap_stem>_mp_join.csv'. Each row represents one MP_JOIN subflow event.
+    Extract MP_JOIN features and write one aggregate row per MPTCP connection.
+
+    Connections are correlated using MP_CAPABLE keys, MP_JOIN tokens, and
+    canonical TCP subflow endpoints.
     """
     pcap_path = Path(pcap_path).expanduser().resolve()
     if not pcap_path.exists():
@@ -170,98 +197,126 @@ def extract_mp_join_to_csv(
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows: list[dict] = []
+    connection_events: dict[str, list[dict]] = {}
+    connection_last_ts: dict[str, float] = {}
+    subflow_to_connection: dict[tuple[tuple[str, int], tuple[str, int]], str] = {}
+    token_to_connection: dict[str, str] = {}
+    next_connection_id = 1
     packet_count = 0
     t_start = time.perf_counter()
-    capture_end_ts = None
 
     for ts, packet_bytes in stream_pcap_packets(pcap_path):
+        mptcp = parse_mptcp_packet(packet_bytes)
+        if mptcp is None:
+            continue
+
+        subflow_key = _subflow_key(mptcp)
+        connection_id = subflow_to_connection.get(subflow_key)
+        connection_token = _connection_token(mptcp)
+        if connection_id is None and connection_token:
+            connection_id = token_to_connection.get(connection_token)
+        if connection_id is None:
+            connection_id = f"conn_{next_connection_id}"
+            next_connection_id += 1
+        subflow_to_connection[subflow_key] = connection_id
+        if connection_token:
+            token_to_connection[connection_token] = connection_id
+        connection_last_ts[connection_id] = ts
+
         parsed = parse_mp_join_packet(packet_bytes)
         if parsed is None:
             continue
 
         packet_count += 1
-        if capture_end_ts is None or ts > capture_end_ts:
-            capture_end_ts = ts
-
-        rows.append(
-            {
-                "pcap_file": pcap_path.name,
-                "src_ip": parsed["src_ip"],
-                "dst_ip": parsed["dst_ip"],
-                "sport": parsed["sport"],
-                "dport": parsed["dport"],
-                "token": _format_hex(parsed["token"]),
-                "address_id": parsed["address_id"],
-                "nonce": _format_hex(parsed["nonce"]),
-                "hmac": _format_hex(parsed["hmac"]),
-                "new_subflow_count": 1,
-                "subflow_creation_time": f"{ts:.6f}",
-                "subflow_lifetime": "",
-                "subflow_duration": "",
-                "concurrent_subflow_count": 0,
-                "active_subflow_count": 0,
-                "maximum_subflow_count": 0,
-            }
-        )
+        connection_events.setdefault(connection_id, []).append({
+            "timestamp": ts,
+            "subflow_key": subflow_key,
+            "src_ip": parsed["src_ip"],
+            "dst_ip": parsed["dst_ip"],
+            "sport": parsed["sport"],
+            "dport": parsed["dport"],
+            "token": _format_hex(parsed["token"]),
+            "address_id": parsed["address_id"],
+            "nonce": _format_hex(parsed["nonce"]),
+            "hmac": _format_hex(parsed["hmac"]),
+        })
 
         if limit_packets is not None and packet_count >= limit_packets:
             break
-
-    total_join_events = len(rows)
-    if capture_end_ts is None:
-        capture_end_ts = 0.0
-
-    for row in rows:
-        creation_ts = float(row["subflow_creation_time"])
-        lifetime = max(capture_end_ts - creation_ts, 0.0)
-        row["subflow_lifetime"] = f"{lifetime:.6f}"
-        row["subflow_duration"] = f"{lifetime:.6f}"
-        row["concurrent_subflow_count"] = total_join_events
-        row["active_subflow_count"] = total_join_events
-        row["maximum_subflow_count"] = total_join_events
 
     with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
             "PCAP File",
+            "MPTCP Connection ID",
             "Source IP",
             "Destination IP",
             "Source Port",
             "Destination Port",
-            "Token",
-            "Address ID",
-            "Nonce",
-            "HMAC",
-            "New Subflow Count",
-            "Subflow Creation Time",
-            "Subflow Lifetime",
-            "Subflow Duration",
-            "Concurrent Subflow Count",
-            "Active Subflow Count",
-            "Maximum Subflow Count",
+            "MP_JOIN Event Count",
+            "Joined Subflow Count",
+            "Tokens",
+            "Address IDs",
+            "Nonces",
+            "HMACs",
+            "First Subflow Creation Time",
+            "Connection Join Duration",
+            "Maximum Active Subflows",
+            "Average Active Subflows",
         ])
 
-        for row in rows:
+        for connection_id in sorted(connection_events):
+            events = connection_events[connection_id]
+            first_event = events[0]
+            connection_end_ts = connection_last_ts[connection_id]
+            subflow_starts = {
+                event["subflow_key"]: event["timestamp"] for event in events
+            }
+            intervals = [
+                (
+                    start,
+                    connection_end_ts,
+                )
+                for start in subflow_starts.values()
+            ]
+            boundaries = sorted({
+                timestamp for interval in intervals for timestamp in interval
+            })
+            maximum_active = 0
+            weighted_active = 0.0
+            for start, end in zip(boundaries, boundaries[1:]):
+                midpoint = (start + end) / 2
+                active = sum(
+                    interval_start <= midpoint <= interval_end
+                    for interval_start, interval_end in intervals
+                )
+                maximum_active = max(maximum_active, active)
+                weighted_active += active * (end - start)
+            duration = max(connection_end_ts - min(subflow_starts.values()), 0.0)
+            average_active = weighted_active / duration if duration > 0 else float(len(subflow_starts))
             writer.writerow([
-                row["pcap_file"],
-                row["src_ip"],
-                row["dst_ip"],
-                row["sport"],
-                row["dport"],
-                row["token"],
-                row["address_id"] if row["address_id"] is not None else "",
-                row["nonce"],
-                row["hmac"],
-                row["new_subflow_count"],
-                row["subflow_creation_time"],
-                row["subflow_lifetime"],
-                row["subflow_duration"],
-                row["concurrent_subflow_count"],
-                row["active_subflow_count"],
-                row["maximum_subflow_count"],
+                pcap_path.name,
+                connection_id,
+                first_event["src_ip"],
+                first_event["dst_ip"],
+                first_event["sport"],
+                first_event["dport"],
+                len(events),
+                len(subflow_starts),
+                ";".join(sorted({event["token"] for event in events if event["token"]})),
+                ";".join(sorted({
+                    str(event["address_id"]) for event in events
+                    if event["address_id"] is not None
+                })),
+                ";".join(sorted({event["nonce"] for event in events if event["nonce"]})),
+                ";".join(sorted({event["hmac"] for event in events if event["hmac"]})),
+                f"{min(subflow_starts.values()):.6f}",
+                f"{duration:.6f}",
+                maximum_active,
+                f"{average_active:.6f}",
             ])
 
+    total_join_events = sum(len(events) for events in connection_events.values())
     elapsed = max(time.perf_counter() - t_start, 1e-9)
 
     return {
@@ -269,6 +324,7 @@ def extract_mp_join_to_csv(
         "csv_file": str(csv_path),
         "packet_count": packet_count,
         "mp_join_events": total_join_events,
+        "connection_count": len(connection_events),
         "csv_size_bytes": csv_path.stat().st_size,
         "processing_time_seconds": elapsed,
     }

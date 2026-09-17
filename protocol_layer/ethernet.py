@@ -21,6 +21,12 @@ except ImportError:
     dpkt = None
 
 try:
+    from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
+except ImportError:
+    compute_mptcp_token = None
+    parse_mptcp_packet = None
+
+try:
     from scapy.utils import RawPcapReader, RawPcapNgReader
 except ImportError:
     RawPcapReader = None
@@ -267,12 +273,7 @@ def extract_ethernet_to_csv(
     limit_packets: int | None = None,
     batch_size: int = DEFAULT_CSV_BATCH_SIZE,
 ) -> dict:
-    """
-    Extract and evaluate Ethernet features from a PCAP file and save directly to a CSV file.
-    The CSV file has the exact same base name as the PCAP file (e.g., 'traffic.pcap' -> 'traffic.csv').
-
-    Streaming batch writes ensure memory consumption remains O(1) regardless of PCAP size.
-    """
+    """Extract aggregate Ethernet features with one row per MPTCP connection."""
     pcap_path = Path(pcap_path).resolve()
     if not pcap_path.exists():
         raise FileNotFoundError(f"PCAP file not found: {pcap_path}")
@@ -288,82 +289,128 @@ def extract_ethernet_to_csv(
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    evaluator = EthernetFeatureEvaluator(link_speed_bps=link_speed_bps)
-    batch = []
+    if parse_mptcp_packet is None or compute_mptcp_token is None:
+        raise RuntimeError("MPTCP parser is required for per-connection Ethernet extraction.")
+
+    connections: dict[str, dict] = {}
+    subflow_to_connection: dict[tuple[tuple[str, int], tuple[str, int]], str] = {}
+    token_to_connection: dict[str, str] = {}
+    next_connection_id = 1
+    packet_count = 0
     t_start = time.perf_counter()
+
+    for ts, pkt_bytes in stream_pcap_packets(pcap_path):
+        parsed = parse_mptcp_packet(pkt_bytes)
+        if parsed is None:
+            continue
+
+        subflow_key = tuple(sorted((
+            (parsed["src_ip"], parsed["sport"]),
+            (parsed["dst_ip"], parsed["dport"]),
+        )))
+        connection_id = subflow_to_connection.get(subflow_key)
+        if connection_id is None:
+            token = None
+            if parsed.get("sender_key"):
+                token = compute_mptcp_token(parsed["sender_key"])
+            elif parsed.get("receiver_key"):
+                token = compute_mptcp_token(parsed["receiver_key"])
+            elif parsed.get("join_token"):
+                token = f"0x{parsed['join_token'].hex().upper()}"
+
+            if token:
+                connection_id = token_to_connection.get(token)
+                if connection_id is None:
+                    connection_id = f"conn_{next_connection_id}"
+                    next_connection_id += 1
+                    token_to_connection[token] = connection_id
+            else:
+                connection_id = f"conn_{next_connection_id}"
+                next_connection_id += 1
+            subflow_to_connection[subflow_key] = connection_id
+
+        state = connections.setdefault(connection_id, {
+            "packet_count": 0,
+            "total_bytes": 0,
+            "min_frame_size": None,
+            "max_frame_size": None,
+            "first_timestamp": ts,
+            "last_timestamp": ts,
+            "source_macs": set(),
+            "destination_macs": set(),
+            "ethertypes": set(),
+            "vlan_ids": set(),
+        })
+        src_mac, dst_mac, ethertype, vlan_id, frame_len = parse_ethernet_header(pkt_bytes)
+        state["packet_count"] += 1
+        packet_count += 1
+        state["total_bytes"] += frame_len
+        state["min_frame_size"] = frame_len if state["min_frame_size"] is None else min(state["min_frame_size"], frame_len)
+        state["max_frame_size"] = frame_len if state["max_frame_size"] is None else max(state["max_frame_size"], frame_len)
+        state["last_timestamp"] = ts
+        state["source_macs"].add(src_mac)
+        state["destination_macs"].add(dst_mac)
+        state["ethertypes"].add(ethertype)
+        if vlan_id is not None:
+            state["vlan_ids"].add(str(vlan_id))
+
+        if limit_packets is not None and packet_count >= limit_packets:
+            break
 
     with open(csv_path, "w", newline="", buffering=2 * 1024 * 1024, encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
-            "Packet Number",
-            "Timestamp",
-            "Source MAC",
-            "Destination MAC",
-            "EtherType",
-            "VLAN ID",
-            "Frame Length",
+            "PCAP File",
+            "MPTCP Connection ID",
+            "Packet Count",
+            "Source MACs",
+            "Destination MACs",
+            "EtherTypes",
+            "VLAN IDs",
+            "Total Bytes",
             "Average Frame Size",
             "Maximum Frame Size",
             "Minimum Frame Size",
             "Interface Utilization",
         ])
-
-        for ts, pkt_bytes in stream_pcap_packets(pcap_path):
-            (
-                pkt_num,
-                pkt_ts,
-                src_mac,
-                dst_mac,
-                ethertype,
-                vlan_id,
-                frame_len,
-                avg_size,
-                max_size,
-                min_size,
-                utilization,
-            ) = evaluator.evaluate_frame(ts, pkt_bytes)
-
-            batch.append((
-                pkt_num,
-                f"{pkt_ts:.6f}",
-                src_mac,
-                dst_mac,
-                ethertype,
-                vlan_id if vlan_id is not None else "",
-                frame_len,
-                f"{avg_size:.2f}",
-                max_size,
-                min_size,
+        for connection_id in sorted(connections):
+            state = connections[connection_id]
+            duration = max(state["last_timestamp"] - state["first_timestamp"], 0.0)
+            utilization = (
+                state["total_bytes"] * 8.0 / (duration * link_speed_bps) * 100.0
+                if duration > 0 and link_speed_bps > 0 else 0.0
+            )
+            writer.writerow([
+                pcap_path.name,
+                connection_id,
+                state["packet_count"],
+                ";".join(sorted(state["source_macs"])),
+                ";".join(sorted(state["destination_macs"])),
+                ";".join(sorted(state["ethertypes"])),
+                ";".join(sorted(state["vlan_ids"])),
+                state["total_bytes"],
+                f"{state['total_bytes'] / state['packet_count']:.2f}",
+                state["max_frame_size"],
+                state["min_frame_size"],
                 f"{utilization:.6f}",
-            ))
-
-            if len(batch) >= batch_size:
-                writer.writerows(batch)
-                batch.clear()
-
-            if limit_packets is not None and evaluator.packet_count >= limit_packets:
-                break
-
-        if batch:
-            writer.writerows(batch)
-            batch.clear()
+            ])
 
     t_elapsed = max(time.perf_counter() - t_start, 1e-9)
     csv_size = csv_path.stat().st_size if csv_path.exists() else 0
+    total_bytes = sum(state["total_bytes"] for state in connections.values())
 
     return {
         "pcap_file": str(pcap_path),
         "csv_file": str(csv_path),
-        "packet_count": evaluator.packet_count,
-        "total_bytes": evaluator.total_bytes,
+        "packet_count": packet_count,
+        "connection_count": len(connections),
+        "total_bytes": total_bytes,
         "csv_size_bytes": csv_size,
-        "min_frame_size": evaluator.min_frame_size or 0,
-        "max_frame_size": evaluator.max_frame_size or 0,
-        "avg_frame_size": evaluator.total_bytes / evaluator.packet_count if evaluator.packet_count else 0.0,
-        "first_timestamp": evaluator.first_timestamp,
-        "last_timestamp": evaluator.last_timestamp,
+        "min_frame_size": min((state["min_frame_size"] for state in connections.values() if state["min_frame_size"] is not None), default=0),
+        "max_frame_size": max((state["max_frame_size"] for state in connections.values() if state["max_frame_size"] is not None), default=0),
+        "avg_frame_size": total_bytes / packet_count if packet_count else 0.0,
         "processing_time_seconds": t_elapsed,
-        "throughput_packets_per_sec": evaluator.packet_count / t_elapsed,
+        "throughput_packets_per_sec": packet_count / t_elapsed,
     }
 
 
@@ -427,4 +474,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

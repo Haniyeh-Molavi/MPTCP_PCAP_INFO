@@ -18,11 +18,20 @@ if str(_ROOT_DIR) not in sys.path:
 # Import streaming reader from ethernet module or fallback
 try:
     from protocol_layer.ethernet import stream_pcap_packets
+    from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
 except ImportError:
     try:
         from ethernet import stream_pcap_packets
+        from mptcp_level import compute_mptcp_token, parse_mptcp_packet
     except ImportError:
         import dpkt
+
+        def compute_mptcp_token(key_bytes: bytes) -> str:
+            return ""
+
+        def parse_mptcp_packet(packet_bytes: bytes) -> dict | None:
+            return None
+
         def stream_pcap_packets(file_path: Path | str) -> Iterator[Tuple[float, bytes]]:
             with open(file_path, "rb") as f:
                 reader = dpkt.pcap.Reader(f)
@@ -421,6 +430,23 @@ class TCPFeatureEvaluator:
         )
 
 
+def _canonical_subflow_key(parsed: dict) -> tuple[tuple[str, int], tuple[str, int]]:
+    return tuple(sorted((
+        (parsed["src_ip"], parsed["sport"]),
+        (parsed["dst_ip"], parsed["dport"]),
+    )))
+
+
+def _mptcp_token(parsed: dict) -> str:
+    key = parsed.get("sender_key") or parsed.get("receiver_key")
+    if key:
+        return compute_mptcp_token(key)
+    join_token = parsed.get("join_token")
+    if join_token:
+        return f"0x{join_token.hex().upper()}"
+    return ""
+
+
 def extract_tcp_to_csv(
     pcap_path: Path | str,
     output_csv_path: Path | str | None = None,
@@ -430,7 +456,7 @@ def extract_tcp_to_csv(
     """
     Extract and calculate all 34 TCP features from a PCAP file and save directly to a CSV file.
     By default, saves to '[pcap_stem]_tcp.csv' alongside the PCAP.
-    Streaming batch writes ensure O(1) memory usage regardless of PCAP size.
+    Writes one aggregate row per detected MPTCP connection.
     """
     pcap_path = Path(pcap_path).resolve()
     if not pcap_path.exists():
@@ -448,35 +474,59 @@ def extract_tcp_to_csv(
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     evaluator = TCPFeatureEvaluator()
-    batch = []
+    subflow_to_connection: dict[tuple[tuple[str, int], tuple[str, int]], str] = {}
+    token_to_connection: dict[str, str] = {}
+    connection_flows: dict[str, set[tuple]] = {}
+    connection_times: dict[str, list[float]] = {}
+    next_connection_id = 1
     t_start = time.perf_counter()
     skipped_non_tcp = 0
 
     with open(csv_path, "w", newline="", buffering=2 * 1024 * 1024, encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
+        for ts, pkt_bytes in stream_pcap_packets(pcap_path):
+            parsed = parse_tcp_segment(pkt_bytes)
+            if parsed is None:
+                skipped_non_tcp += 1
+                continue
+
+            mptcp = parse_mptcp_packet(pkt_bytes)
+            if mptcp is None:
+                continue
+
+            subflow_key = _canonical_subflow_key(parsed)
+            connection_id = subflow_to_connection.get(subflow_key)
+            token = _mptcp_token(mptcp)
+            if connection_id is None and token:
+                connection_id = token_to_connection.get(token)
+            if connection_id is None:
+                connection_id = f"conn_{next_connection_id}"
+                next_connection_id += 1
+            subflow_to_connection[subflow_key] = connection_id
+            if token:
+                token_to_connection[token] = connection_id
+
+            evaluator.evaluate_packet(ts, parsed)
+            flow_key = tuple(sorted((
+                (parsed["src_ip"], parsed["sport"]),
+                (parsed["dst_ip"], parsed["dport"]),
+            )))
+            connection_flows.setdefault(connection_id, set()).add(flow_key)
+            connection_times.setdefault(connection_id, []).append(ts)
+
+            if limit_packets is not None and evaluator.packet_count >= limit_packets:
+                break
+
         writer.writerow([
-            "Packet Number",
-            "Timestamp",
-            "Source Port",
-            "Destination Port",
-            "Sequence Number",
-            "Acknowledgment Number",
-            "Window Size",
-            "Checksum",
-            "TCP Length",
-            "Flags (SYN)",
-            "Flags (ACK)",
-            "Flags (FIN)",
-            "Flags (RST)",
-            "Flags (PSH)",
-            "Flags (URG)",
-            "MSS Option",
-            "SACK Option",
-            "Timestamp Option",
-            "Window Scale Option",
-            "Retransmission Count",
-            "Fast Retransmission Count",
-            "Duplicate ACK Count",
+            "PCAP File",
+            "MPTCP Connection ID",
+            "Subflow Count",
+            "Packet Count",
+            "Total Bytes",
+            "Total TCP Payload Bytes",
+            "Retransmissions",
+            "Fast Retransmissions",
+            "Duplicate ACKs",
             "Out-of-Order Packets",
             "RTT",
             "RTT Min",
@@ -489,29 +539,77 @@ def extract_tcp_to_csv(
             "Flow Completion Time",
             "Idle Time",
             "Active Time",
-            "Inter-arrival Time",
-            "Burst Size",
         ])
 
-        for ts, pkt_bytes in stream_pcap_packets(pcap_path):
-            parsed = parse_tcp_segment(pkt_bytes)
-            if parsed is None:
-                skipped_non_tcp += 1
-                continue
-
-            row = evaluator.evaluate_packet(ts, parsed)
-            batch.append(row)
-
-            if len(batch) >= batch_size:
-                writer.writerows(batch)
-                batch.clear()
-
-            if limit_packets is not None and evaluator.packet_count >= limit_packets:
-                break
-
-        if batch:
-            writer.writerows(batch)
-            batch.clear()
+        for connection_id in sorted(connection_flows):
+            flows = [
+                evaluator.flows[flow_key]
+                for flow_key in connection_flows[connection_id]
+            ]
+            timestamps = connection_times[connection_id]
+            start_time = min(timestamps)
+            end_time = max(timestamps)
+            duration = max(end_time - start_time, 1e-6)
+            packet_count = sum(flow.packet_count for flow in flows)
+            total_bytes = sum(flow.total_bytes for flow in flows)
+            payload_bytes = sum(flow.goodput_bytes for flow in flows)
+            retransmissions = sum(flow.retrans_count for flow in flows)
+            fast_retransmissions = sum(flow.fast_retrans_count for flow in flows)
+            duplicate_acks = sum(flow.dupack_count for flow in flows)
+            out_of_order = sum(flow.ooo_count for flow in flows)
+            congestion = sum(flow.congestion_events for flow in flows)
+            rtt_samples = [
+                (flow.rtt_mean, flow.rtt_count, flow.rtt_M2)
+                for flow in flows
+                if flow.rtt_count > 0
+            ]
+            rtt_count = sum(item[1] for item in rtt_samples)
+            mean_rtt = (
+                sum(item[0] * item[1] for item in rtt_samples) / rtt_count
+                if rtt_count
+                else 0.0
+            )
+            rtt_variance = (
+                sum(
+                    item[2] + item[1] * (item[0] - mean_rtt) ** 2
+                    for item in rtt_samples
+                ) / (rtt_count - 1)
+                if rtt_count > 1
+                else 0.0
+            )
+            rtt_min = min(
+                (flow.rtt_min for flow in flows if flow.rtt_min is not None),
+                default=0.0,
+            )
+            rtt_max = max(
+                (flow.rtt_max for flow in flows if flow.rtt_max is not None),
+                default=0.0,
+            )
+            idle_time = sum(flow.idle_time for flow in flows)
+            active_time = sum(flow.active_time for flow in flows)
+            writer.writerow([
+                pcap_path.name,
+                connection_id,
+                len(flows),
+                packet_count,
+                total_bytes,
+                payload_bytes,
+                retransmissions,
+                fast_retransmissions,
+                duplicate_acks,
+                out_of_order,
+                f"{mean_rtt:.6f}",
+                f"{rtt_min:.6f}",
+                f"{rtt_max:.6f}",
+                f"{math.sqrt(rtt_variance):.6f}",
+                f"{retransmissions / max(packet_count, 1):.6f}",
+                f"{total_bytes / duration:.6f}",
+                f"{payload_bytes / duration:.6f}",
+                congestion,
+                f"{duration:.6f}",
+                f"{idle_time:.6f}",
+                f"{active_time:.6f}",
+            ])
 
     t_elapsed = max(time.perf_counter() - t_start, 1e-9)
     csv_size = csv_path.stat().st_size if csv_path.exists() else 0
@@ -523,6 +621,7 @@ def extract_tcp_to_csv(
         "pcap_file": str(pcap_path),
         "csv_file": str(csv_path),
         "packet_count": evaluator.packet_count,
+        "connection_count": len(connection_flows),
         "skipped_non_tcp": skipped_non_tcp,
         "csv_size_bytes": csv_size,
         "tcp_flows_count": len(evaluator.flows),
@@ -585,4 +684,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

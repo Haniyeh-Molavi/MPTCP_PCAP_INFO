@@ -99,7 +99,12 @@ def _canonical_subflow_key(src_ip: str, sport: int, dst_ip: str, dport: int) -> 
     return tuple(sorted((endpoint_a, endpoint_b)))  # type: ignore[return-value]
 
 
-def _resolve_connection_id(parsed: dict, known_connections: dict[str, str], next_connection_index: int) -> tuple[str, int]:
+def _resolve_connection_id(
+    parsed: dict,
+    known_connections: dict[str, str],
+    token_to_connection: dict[str, str],
+    next_connection_index: int,
+) -> tuple[str, int]:
     sender_key = parsed.get("sender_key")
     receiver_key = parsed.get("receiver_key")
 
@@ -107,12 +112,21 @@ def _resolve_connection_id(parsed: dict, known_connections: dict[str, str], next
         conn_id = compute_mptcp_token(sender_key)
         if conn_id:
             known_connections[conn_id] = conn_id
+            token_to_connection[conn_id] = conn_id
             return conn_id, next_connection_index
 
     if receiver_key:
         conn_id = compute_mptcp_token(receiver_key)
         if conn_id:
             known_connections[conn_id] = conn_id
+            token_to_connection[conn_id] = conn_id
+            return conn_id, next_connection_index
+
+    join_token = parsed.get("join_token")
+    if join_token:
+        token = f"0x{join_token.hex().upper()}"
+        conn_id = token_to_connection.get(token)
+        if conn_id is not None:
             return conn_id, next_connection_index
 
     default_conn_id = f"conn_{next_connection_index}"
@@ -150,6 +164,7 @@ def extract_subflow_level_statistics_to_csv(
 
     subflows: dict[tuple[str, tuple[str, int, str, int]], SubflowState] = {}
     connection_ids: dict[str, str] = {}
+    token_to_connection: dict[str, str] = {}
     ip_to_conn: dict[tuple[str, int, str, int], str] = {}
     next_connection_index = 1
     packet_count = 0
@@ -173,8 +188,18 @@ def extract_subflow_level_statistics_to_csv(
         connection_id = ip_to_conn.get(subflow_key)
 
         if connection_id is None:
-            connection_id, next_connection_index = _resolve_connection_id(parsed, connection_ids, next_connection_index)
+            connection_id, next_connection_index = _resolve_connection_id(
+                parsed,
+                connection_ids,
+                token_to_connection,
+                next_connection_index,
+            )
             ip_to_conn[subflow_key] = connection_id
+            join_token = parsed.get("join_token")
+            if join_token:
+                token_to_connection[
+                    f"0x{join_token.hex().upper()}"
+                ] = connection_id
 
         state_key = (connection_id, subflow_key)
         state = subflows.get(state_key)
@@ -194,65 +219,88 @@ def extract_subflow_level_statistics_to_csv(
         if limit_packets is not None and packet_count >= limit_packets:
             break
 
+    states_by_connection: dict[str, list[SubflowState]] = {}
+    for (connection_id, _), state in subflows.items():
+        states_by_connection.setdefault(connection_id, []).append(state)
+
     rows = []
-    for (connection_id, _), state in sorted(subflows.items(), key=lambda item: (item[0][0], item[1].src_ip, item[1].dst_ip, item[1].sport, item[1].dport)):
-        lifetime = max(state.last_ts - state.first_ts, 0.0)
+    for connection_id, connection_states in sorted(states_by_connection.items()):
+        first_ts = min(state.first_ts for state in connection_states)
+        last_ts = max(state.last_ts for state in connection_states)
+        lifetime = max(last_ts - first_ts, 0.0)
         duration = max(lifetime, 1e-6)
-
-        if state.rtt_samples:
-            mean_rtt = sum(state.rtt_samples) / len(state.rtt_samples)
-            rtt_variance = sum((sample - mean_rtt) ** 2 for sample in state.rtt_samples) / len(state.rtt_samples)
-            if len(state.rtt_samples) > 1:
-                jitter = sum(abs(state.rtt_samples[i] - state.rtt_samples[i - 1]) for i in range(1, len(state.rtt_samples))) / (len(state.rtt_samples) - 1)
-            else:
-                jitter = 0.0
+        rtt_samples = [
+            sample for state in connection_states for sample in state.rtt_samples
+        ]
+        if rtt_samples:
+            mean_rtt = sum(rtt_samples) / len(rtt_samples)
+            rtt_variance = sum(
+                (sample - mean_rtt) ** 2 for sample in rtt_samples
+            ) / len(rtt_samples)
+            jitter = (
+                sum(
+                    abs(rtt_samples[i] - rtt_samples[i - 1])
+                    for i in range(1, len(rtt_samples))
+                ) / (len(rtt_samples) - 1)
+                if len(rtt_samples) > 1
+                else 0.0
+            )
         else:
-            mean_rtt = 0.0
-            rtt_variance = 0.0
-            jitter = 0.0
+            mean_rtt = rtt_variance = jitter = 0.0
 
-        throughput = (state.bytes_sent + state.bytes_received) / duration
-        goodput = state.goodput_bytes / duration
-        loss_rate = state.retransmissions / max(state.packet_count, 1)
-        utilization_ratio = throughput / 1_000_000.0
+        bytes_sent = sum(state.bytes_sent for state in connection_states)
+        bytes_received = sum(state.bytes_received for state in connection_states)
+        packet_total = sum(state.packet_count for state in connection_states)
+        retransmissions = sum(state.retransmissions for state in connection_states)
+        congestion_events = sum(state.congestion_events for state in connection_states)
+        goodput_bytes = sum(state.goodput_bytes for state in connection_states)
+        throughput = (bytes_sent + bytes_received) / duration
+        goodput = goodput_bytes / duration
 
-        rows.append(
-            {
-                "pcap_file": pcap_path.name,
-                "mptcp_connection_id": connection_id,
-                "subflow_id": _subflow_id(connection_id, state.src_ip, state.sport, state.dst_ip, state.dport),
-                "source_ip": state.src_ip,
-                "destination_ip": state.dst_ip,
-                "source_port": state.sport,
-                "destination_port": state.dport,
-                "rtt": mean_rtt,
-                "rtt_variance": rtt_variance,
-                "jitter": jitter,
-                "loss_rate": loss_rate,
-                "retransmissions": state.retransmissions,
-                "congestion_events": state.congestion_events,
-                "bytes_sent": state.bytes_sent,
-                "bytes_received": state.bytes_received,
-                "packet_count": state.packet_count,
-                "throughput": throughput,
-                "goodput": goodput,
-                "utilization_ratio": utilization_ratio,
-                "lifetime": lifetime,
-                "idle_time": 0.0,
-                "active_time": lifetime,
-            }
-        )
+        rows.append({
+            "pcap_file": pcap_path.name,
+            "mptcp_connection_id": connection_id,
+            "subflow_id": ";".join(sorted(
+                _subflow_id(
+                    connection_id,
+                    state.src_ip,
+                    state.sport,
+                    state.dst_ip,
+                    state.dport,
+                )
+                for state in connection_states
+            )),
+            "source_ip": ";".join(sorted({state.src_ip for state in connection_states})),
+            "destination_ip": ";".join(sorted({state.dst_ip for state in connection_states})),
+            "source_port": ";".join(sorted({str(state.sport) for state in connection_states})),
+            "destination_port": ";".join(sorted({str(state.dport) for state in connection_states})),
+            "rtt": mean_rtt,
+            "rtt_variance": rtt_variance,
+            "jitter": jitter,
+            "loss_rate": retransmissions / max(packet_total, 1),
+            "retransmissions": retransmissions,
+            "congestion_events": congestion_events,
+            "bytes_sent": bytes_sent,
+            "bytes_received": bytes_received,
+            "packet_count": packet_total,
+            "throughput": throughput,
+            "goodput": goodput,
+            "utilization_ratio": throughput / 1_000_000.0,
+            "lifetime": lifetime,
+            "idle_time": 0.0,
+            "active_time": lifetime,
+        })
 
     with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
             "PCAP File",
             "MPTCP Connection ID",
-            "Subflow ID",
-            "Source IP",
-            "Destination IP",
-            "Source Port",
-            "Destination Port",
+            "Subflow IDs",
+            "Source IPs",
+            "Destination IPs",
+            "Source Ports",
+            "Destination Ports",
             "RTT",
             "RTT Variance",
             "Jitter",
@@ -301,7 +349,8 @@ def extract_subflow_level_statistics_to_csv(
         "pcap_file": str(pcap_path),
         "csv_file": str(csv_path),
         "packet_count": packet_count,
-        "subflow_count": len(rows),
+        "subflow_count": len(subflows),
+        "connection_count": len(rows),
         "csv_size_bytes": csv_path.stat().st_size,
         "processing_time_seconds": elapsed,
     }
