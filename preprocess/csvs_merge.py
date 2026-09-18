@@ -3,7 +3,7 @@ import os
 from functools import reduce
 
 # Folder containing CSV files
-csv_folder = r"C:\Users\sadra\Source\MPTCP_PCAP_INFO\outputs\Protocol Layer\REMOVE_ADDR"
+csv_folder = r"C:\Users\sadra\Source\MPTCP_PCAP_INFO\outputs\Protocol Layer\tcp"
 
 # Get all CSV files
 csv_files = [

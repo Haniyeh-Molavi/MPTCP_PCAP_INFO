@@ -5,6 +5,7 @@ import csv
 import hashlib
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -32,6 +33,21 @@ except ImportError:
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
 DEFAULT_CSV_BATCH_SIZE = 5000
+
+
+def pcap_file_id(pcap_path: Path | str) -> int:
+    """Return the trailing four-digit identifier from a PCAP filename."""
+    filename = Path(pcap_path).name
+    match = re.search(r"(\d{4})$", Path(filename).stem)
+    if match is None:
+        raise ValueError(
+            f"PCAP filename must end with four digits before its extension: {filename}"
+        )
+
+    value = int(match.group(1))
+    if value > 2**63 - 1:
+        raise ValueError(f"PCAP file identifier is outside int64 range: {filename}")
+    return value
 
 
 def compute_mptcp_token(key_bytes: bytes) -> str:
@@ -363,6 +379,7 @@ class MPTCPFeatureEvaluator:
         rtt_str = f"{conn.rtt_mean:.6f}" if conn.rtt_count > 0 else ""
 
         return (
+            conn_id,
             self.packet_count,
             f"{timestamp:.6f}",
             sender_key_str,
@@ -412,6 +429,7 @@ def extract_mptcp_to_csv(
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     evaluator = MPTCPFeatureEvaluator()
+    pcap_id = pcap_file_id(pcap_path)
     batch = []
     t_start = time.perf_counter()
     skipped_non_mptcp = 0
@@ -419,6 +437,8 @@ def extract_mptcp_to_csv(
     with open(csv_path, "w", newline="", buffering=2 * 1024 * 1024, encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
+            "PCAP File",
+            "MPTCP Connection ID",
             "Packet Number",
             "Timestamp",
             "Sender Key",
@@ -446,7 +466,7 @@ def extract_mptcp_to_csv(
                 skipped_non_mptcp += 1
                 continue
 
-            row = evaluator.evaluate_packet(ts, parsed)
+            row = (pcap_id,) + evaluator.evaluate_packet(ts, parsed)
             batch.append(row)
 
             if len(batch) >= batch_size:

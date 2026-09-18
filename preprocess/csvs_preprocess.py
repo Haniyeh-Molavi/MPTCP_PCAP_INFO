@@ -24,41 +24,50 @@ print(f"\nSelected: {selected_folder}")
 
 # Process each subfolder
 for subfolder in os.listdir(selected_path):
+    if subfolder == "mptcp_behavior":
+         # Skip the REMOVE_ADDR folder
+        subfolder_path = os.path.join(selected_path, subfolder)
 
-    subfolder_path = os.path.join(selected_path, subfolder)
+        if not os.path.isdir(subfolder_path):
+            continue
 
-    if not os.path.isdir(subfolder_path):
-        continue
+        print(f"Processing: {subfolder}")
 
-    print(f"Processing: {subfolder}")
+        csv_files = glob.glob(os.path.join(subfolder_path, "*.csv"))
 
-    csv_files = glob.glob(os.path.join(subfolder_path, "*.csv"))
+        if not csv_files:
+            print("  No CSV files found.")
+            continue
 
-    if not csv_files:
-        print("  No CSV files found.")
-        continue
+        dfs = []
+        for file in csv_files:
+            df = pd.read_csv(file)
 
-    dfs = []
+            print(file)
+            print(df.dtypes)
+            print("-" * 50)
 
-    for csv_file in csv_files:
-        df = pd.read_csv(csv_file)
 
-        if "PCAP File" in df.columns:
-            df["PCAP File"] = (
-                df["PCAP File"]
-                .astype(str)
-                .str.extract(r'(\d{4})\.pcap$')[0]
-                .astype(int)
-            )
+        for csv_file in csv_files:
+            df = pd.read_csv(csv_file)
 
-        dfs.append(df)
+            if "PCAP File" in df.columns:
+                df["PCAP File"] = (
+                    df["PCAP File"]
+                    .astype(str)
+                    .str.extract(r'(\d{4})\.pcap$')[0]
+                    .fillna(1)
+                    .astype(int)
+                )
 
-    merged_df = pd.concat(dfs, ignore_index=True)
+            dfs.append(df)
 
-    # Save using subfolder name
-    output_file = os.path.join(selected_path, f"{subfolder}.csv")
-    merged_df.to_csv(output_file, index=False)
+        merged_df = pd.concat(dfs, ignore_index=True)
 
-    print(f"  Saved: {subfolder}.csv")
+        # Save using subfolder name
+        output_file = os.path.join(selected_path, f"{subfolder}.csv")
+        merged_df.to_csv(output_file, index=False)
+
+        print(f"  Saved: {subfolder}.csv")
 
 print("\nDone!")

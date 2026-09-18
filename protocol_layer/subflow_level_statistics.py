@@ -14,11 +14,11 @@ if str(_ROOT_DIR) not in sys.path:
 
 try:
     from protocol_layer.ethernet import stream_pcap_packets
-    from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
+    from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet, pcap_file_id
 except ImportError:
     try:
         from ethernet import stream_pcap_packets
-        from mptcp_level import compute_mptcp_token, parse_mptcp_packet
+        from mptcp_level import compute_mptcp_token, parse_mptcp_packet, pcap_file_id
     except ImportError:
         import dpkt
 
@@ -33,6 +33,9 @@ except ImportError:
 
         def compute_mptcp_token(key_bytes: bytes) -> str:
             return ""
+
+        def pcap_file_id(pcap_path: Path | str) -> int:
+            raise RuntimeError("PCAP file ID parser is unavailable")
 
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
@@ -258,7 +261,7 @@ def extract_subflow_level_statistics_to_csv(
         goodput = goodput_bytes / duration
 
         rows.append({
-            "pcap_file": pcap_path.name,
+            "pcap_file": pcap_file_id(pcap_path),
             "mptcp_connection_id": connection_id,
             "subflow_id": ";".join(sorted(
                 _subflow_id(

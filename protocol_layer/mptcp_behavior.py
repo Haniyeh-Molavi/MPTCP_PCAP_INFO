@@ -13,11 +13,11 @@ if str(_ROOT_DIR) not in sys.path:
 
 try:
     from protocol_layer.ethernet import DEFAULT_LINK_SPEED_BPS, parse_link_speed, stream_pcap_packets
-    from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet
+    from protocol_layer.mptcp_level import compute_mptcp_token, parse_mptcp_packet, pcap_file_id
 except ImportError:
     try:
         from ethernet import DEFAULT_LINK_SPEED_BPS, parse_link_speed, stream_pcap_packets
-        from mptcp_level import compute_mptcp_token, parse_mptcp_packet
+        from mptcp_level import compute_mptcp_token, parse_mptcp_packet, pcap_file_id
     except ImportError:
         import dpkt
 
@@ -47,6 +47,9 @@ except ImportError:
 
         def compute_mptcp_token(key_bytes: bytes) -> str:
             return ""
+
+        def pcap_file_id(pcap_path: Path | str) -> int:
+            raise RuntimeError("PCAP file ID parser is unavailable")
 
 
 PCAP_EXTENSIONS = {".pcap", ".cap", ".pcapng"}
@@ -333,8 +336,8 @@ class MPTCPBehaviorEvaluator:
 
             rows.append(
                 {
-                    "pcap_file": "",
-                    "mptcp_connection_id": conn_id,
+                    "PCAP File": 0,
+                    "MPTCP Connection ID": conn_id,
                     "start_time": conn.start_ts,
                     "end_time": conn.end_ts,
                     "duration": duration,
@@ -400,11 +403,11 @@ def extract_mptcp_behavior_to_csv(
 
     rows = evaluator.build_rows()
     for row in rows:
-        row["pcap_file"] = pcap_path.name
+        row["PCAP File"] = pcap_file_id(pcap_path)
 
     fieldnames = [
-        "pcap_file",
-        "mptcp_connection_id",
+        "PCAP File",
+        "MPTCP Connection ID",
         "start_time",
         "end_time",
         "duration",
